@@ -1,3 +1,39 @@
+# ---------- main.py (minimal proven boot order) ----------
+import os
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+# 1) Load env FIRST
+load_dotenv()
+TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Set DISCORD_BOT_TOKEN (or DISCORD_TOKEN).")
+
+# 2) Create intents & bot BEFORE any bot.run(...)
+intents = discord.Intents.default()
+intents.guilds = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# 3) (Optional) debug — remove after you see "Logged in as ..."
+print("Token present:", bool(TOKEN))
+print("Token length:", len(TOKEN))
+print("Token preview:", TOKEN[:6], "...", TOKEN[-6:])
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} ({bot.user.id})")
+
+# ---------- PUT YOUR COMMANDS/COGS/VIEW CLASSES BELOW THIS LINE ----------
+# e.g.
+# @bot.tree.command(description="ping")
+# async def ping(interaction: discord.Interaction):
+#     await interaction.response.send_message("pong")
+# ------------------------------------------------------------------------
+
+# 4) Finally, run the bot LAST
+bot.run(TOKEN)
+
 import os
 import io
 import csv
