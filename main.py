@@ -1,4 +1,4 @@
-# main.py — Rally Bot (fixed modals & views, guild sync)
+# main.py — Rally Bot (voice-safe on PaaS, robust views/modals, guild sync)
 
 import os
 import io
@@ -21,14 +21,14 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_BOT_TOKEN (or DISCORD_TOKEN) in your environment.")
 
-GUILD_IDS = os.getenv("GUILD_IDS", "")  # e.g. "123456789012345678,987654321012345678"
-
-def _parse_guild_ids() -> List[int]:
-    return [int(x) for x in GUILD_IDS.split(",") if x.strip().isdigit()]
-
+GUILD_IDS = os.getenv("GUILD_IDS", "")  # e.g. "123...,987..."
 TEMP_VC_CATEGORY_ID = int(os.getenv("TEMP_VC_CATEGORY_ID", "0"))
 HITTERS_ROLE_NAME = os.getenv("HITTERS_ROLE_NAME", "hitters")
 DELETE_VC_IF_EMPTY_AFTER_SECS = int(os.getenv("DELETE_VC_IF_EMPTY_AFTER_SECS", "300"))
+
+# === VOICE FEATURE FLAG ===
+# Many PaaS (incl. typical Render services) do NOT support UDP -> Discord voice will fail.
+ENABLE_VOICE = os.getenv("ENABLE_VOICE", "false").strip().lower() in ("1", "true", "yes")
 
 # Audio URLs
 AUDIO_5M_BOMB = os.getenv("AUDIO_5M_BOMB", "https://storage.googleapis.com/rallybot/5minbombcomplete.mp3")
@@ -43,6 +43,9 @@ AUDIO_15S_ROLL = os.getenv("AUDIO_15S_ROLL", "https://storage.googleapis.com/ral
 AUDIO_30S_ROLL = os.getenv("AUDIO_30S_ROLL", "https://storage.googleapis.com/rallybot/30secondgaps.mp3")
 AUDIO_EXPLAIN_ROLL = os.getenv("AUDIO_EXPLAIN_ROLL", "https://storage.googleapis.com/rallybot/explainrollingrallies.mp3")
 
+def _parse_guild_ids() -> List[int]:
+    return [int(x) for x in GUILD_IDS.split(",") if x.strip().isdigit()]
+
 # ============================== LOGGING & BOT ==============================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -53,7 +56,11 @@ intents.guilds = True
 intents.members = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=True))
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=True),
+)
 tree = bot.tree
 
 # ============================== DATA MODELS ==============================
@@ -77,12 +84,12 @@ class Rally:
     creator_id: int
     rally_kind: Literal["KEEP", "SOP"]
 
-    # Keep fields (max 5 per modal → we keep 5 below)
+    # Keep fields (modal max=5 -> combine idle/scouted)
     keep_power: Optional[str] = None
     primary_troop: Optional[TroopType] = None
     keep_level: Optional[str] = None
     gear_worn: Optional[str] = None
-    idle_and_scouted: Optional[str] = None  # combined to respect modal limit
+    idle_and_scouted: Optional[str] = None
 
     temp_vc_id: Optional[int] = None
     temp_vc_invite_url: Optional[str] = None
@@ -149,7 +156,7 @@ async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
 
 def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
     title = "🏰 Keep Rally" if r.rally_kind == "KEEP" else "🛡️ Seat of Power Rally"
-    desc = f"{role_mention(guild, HITTERS_ROLE_NAME)} — Don't forget to use `/type_of_rally` to pick Bomb or Rolling details!"
+    desc = f"{role_mention(guild, HITTERS_ROLE_NAME)} — Don't forget to use `/type_of_rally` for Bomb/Rolling!"
     e = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
     creator = guild.get_member(r.creator_id)
     e.add_field(name="Host", value=(creator.mention if creator else f"<@{r.creator_id}>"), inline=True)
@@ -174,11 +181,9 @@ def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
     return e
 
 async def dm_join_info(member: discord.Member, r: Rally, sop: bool):
-    """DM the user with a single-use VC invite and thread link."""
-    guild = member.guild
     if not r.temp_vc_id:
         return
-    vc = guild.get_channel(r.temp_vc_id)
+    vc = member.guild.get_channel(r.temp_vc_id)
     if not isinstance(vc, discord.VoiceChannel):
         return
     invite = await vc.create_invite(max_age=3600, max_uses=1, unique=True, reason="Rally user join")
@@ -201,6 +206,76 @@ async def update_post(guild: discord.Guild, r: Rally):
     except Exception:
         return
     await msg.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+
+# ============================== VOICE HELPERS ==============================
+
+def _try_load_opus() -> bool:
+    if discord.opus.is_loaded():
+        return True
+    # Try common lib names
+    for name in ("opus", "libopus.so.0", "libopus"):
+        try:
+            discord.opus.load_opus(name)
+            return True
+        except Exception:
+            continue
+    return False
+
+async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceClient]:
+    """Best-effort connect/move + readiness checks. Returns connected VoiceClient or None."""
+    if not ENABLE_VOICE:
+        return None
+    if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
+        return None
+    if not _try_load_opus():
+        log.error("Opus failed to load. Install system libopus or PyNaCl.")
+        return None
+
+    vc_target = member.voice.channel
+    try:
+        voice = member.guild.voice_client
+        if voice and voice.is_connected():
+            if voice.channel != vc_target:
+                await voice.move_to(vc_target)
+        else:
+            voice = await vc_target.connect(timeout=15.0, reconnect=False)
+
+        # Give a brief moment for UDP/WS to stabilise; bail if disconnected.
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            if voice.is_connected():
+                return voice
+        return None
+    except Exception as e:
+        log.exception("Voice connect/move failed: %s", e)
+        return None
+
+async def play_audio_in_member_vc(member: discord.Member, url: str) -> (bool, str):
+    """
+    Tries to join user's VC and stream an mp3 via ffmpeg.
+    Returns (success, message_for_user).
+    """
+    if not ENABLE_VOICE:
+        return False, "Voice playback is disabled on this host (ENABLE_VOICE=false)."
+
+    voice = await _ensure_voice_ready(member)
+    if not voice or not voice.is_connected():
+        return False, (
+            "Could not connect to voice.\n"
+            "• Hosting providers often block UDP required by Discord voice.\n"
+            "• Ensure **UDP is allowed**, **ffmpeg** is installed, and **Opus** is available."
+        )
+
+    try:
+        if voice.is_playing():
+            voice.stop()
+        # ffmpeg must be installed on the system PATH
+        audio = discord.FFmpegPCMAudio(url)
+        voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
+        return True, "Playback started."
+    except Exception as e:
+        log.exception("Play error: %s", e)
+        return False, "Playback failed (check ffmpeg/Opus/permissions)."
 
 # ============================== VIEWS & MODALS ==============================
 
@@ -257,15 +332,15 @@ def build_rally_view(r: Rally) -> discord.ui.View:
             super().__init__(timeout=3600)
             self.mid = rally_mid
 
-        @discord.ui.button(label="Join Rally", style=discord.ButtonStyle.success, custom_id="join_rally")
-        async def join_rally(self, interaction: discord.Interaction, button: discord.ui.Button):
+        @discord.ui.button(label="Join Rally", style=discord.ButtonStyle.success)
+        async def join_rally(self, interaction: discord.Interaction, _: discord.ui.Button):
             if self.mid not in RALLIES:
                 return await interaction.response.send_message("This rally no longer exists.", ephemeral=True)
             sop = (RALLIES[self.mid].rally_kind == "SOP")
             await interaction.response.send_modal(JoinRallyModal(self.mid, sop=sop))
 
-        @discord.ui.button(label="Export Roster", style=discord.ButtonStyle.primary, custom_id="export_roster")
-        async def export_roster(self, interaction: discord.Interaction, button: discord.ui.Button):
+        @discord.ui.button(label="Export Roster", style=discord.ButtonStyle.primary)
+        async def export_roster(self, interaction: discord.Interaction, _: discord.ui.Button):
             r = RALLIES.get(self.mid)
             if not r:
                 return await interaction.response.send_message("This rally no longer exists.", ephemeral=True)
@@ -327,84 +402,24 @@ class ConfirmJoinVCView(discord.ui.View):
         self.url_label = url_label
 
     @discord.ui.button(label="Join VC & Start", style=discord.ButtonStyle.success)
-    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def yes(self, interaction: discord.Interaction, _: discord.ui.Button):
         member: discord.Member = interaction.user  # type: ignore
         if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
             return await interaction.response.send_message("You must be in a voice channel first.", ephemeral=True)
+
+        if not ENABLE_VOICE:
+            return await interaction.response.send_message(
+                f"Voice playback is disabled on this host. Here’s the audio link for **{self.url_label}**:\n{self.url_to_play}",
+                ephemeral=True
+            )
+
         await interaction.response.defer(ephemeral=True)
-        ok = await play_audio_in_member_vc(member, self.url_to_play)
-        if ok:
-            await interaction.followup.send(f"Playing **{self.url_label}** in {member.voice.channel.mention}", ephemeral=True)
-        else:
-            await interaction.followup.send("Could not start playback (check ffmpeg & permissions).", ephemeral=True)
+        ok, msg = await play_audio_in_member_vc(member, self.url_to_play)
+        await interaction.followup.send(msg if ok else msg, ephemeral=True)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
-    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def no(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message("Cancelled.", ephemeral=True)
-
-async def play_audio_in_member_vc(member: discord.Member, url: str) -> bool:
-    if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
-        return False
-    vc_channel = member.voice.channel
-    try:
-        if member.guild.voice_client and member.guild.voice_client.is_connected():
-            voice = member.guild.voice_client
-            if voice.channel != vc_channel:
-                await voice.move_to(vc_channel)
-        else:
-            voice = await vc_channel.connect()
-        if voice.is_playing():
-            voice.stop()
-        audio = discord.FFmpegPCMAudio(url)
-        voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
-        return True
-    except Exception as e:
-        log.exception("Play error: %s", e)
-        return False
-
-class BombMenuView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="5 Minute Bomb", style=discord.ButtonStyle.danger)
-    async def b5(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_message(
-            "Choose where to explain/run:",
-            view=ExplainOrStartView("5m Bomb", AUDIO_5M_BOMB),
-            ephemeral=True
-        )
-
-    @discord.ui.button(label="10 Minute Bomb", style=discord.ButtonStyle.danger)
-    async def b10(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_message(
-            "Choose where to explain/run:",
-            view=ExplainOrStartView("10m Bomb", AUDIO_10M_BOMB),
-            ephemeral=True
-        )
-
-    @discord.ui.button(label="30 Minute Bomb", style=discord.ButtonStyle.danger)
-    async def b30(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_message(
-            "Choose where to explain/run:",
-            view=ExplainOrStartView("30m Bomb", AUDIO_30M_BOMB),
-            ephemeral=True
-        )
-
-    @discord.ui.button(label="1 Hour Bomb", style=discord.ButtonStyle.danger)
-    async def b60(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_message(
-            "Choose where to explain/run:",
-            view=ExplainOrStartView("1h Bomb", AUDIO_1H_BOMB),
-            ephemeral=True
-        )
-
-    @discord.ui.button(label="Explain Bomb Rally", style=discord.ButtonStyle.success)
-    async def bexplain(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_message(
-            "The bot will join your current VC and start the explanation. Continue?",
-            view=ConfirmJoinVCView("Explain Bomb Rally", AUDIO_EXPLAIN_BOMB),
-            ephemeral=True
-        )
 
 class ExplainOrStartView(discord.ui.View):
     def __init__(self, label: str, url: str):
@@ -432,6 +447,50 @@ class ExplainOrStartView(discord.ui.View):
     async def explain_text(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
             f"**{self.label}**:\n- Join VC.\n- Follow timing as instructed.\n",
+            ephemeral=True
+        )
+
+class BombMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="5 Minute Bomb", style=discord.ButtonStyle.danger)
+    async def b5(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("5m Bomb", AUDIO_5M_BOMB),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="10 Minute Bomb", style=discord.ButtonStyle.danger)
+    async def b10(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("10m Bomb", AUDIO_10M_BOMB),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="30 Minute Bomb", style=discord.ButtonStyle.danger)
+    async def b30(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("30m Bomb", AUDIO_30M_BOMB or "https://example.com/30m.mp3"),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="1 Hour Bomb", style=discord.ButtonStyle.danger)
+    async def b60(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("1h Bomb", AUDIO_1H_BOMB or "https://example.com/1h.mp3"),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Explain Bomb Rally", style=discord.ButtonStyle.success)
+    async def bexplain(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start the explanation. Continue?",
+            view=ConfirmJoinVCView("Explain Bomb Rally", AUDIO_EXPLAIN_BOMB),
             ephemeral=True
         )
 
@@ -495,7 +554,6 @@ rally_group = app_commands.Group(name="rally", description="Create a Keep Rally 
 tree.add_command(rally_group)
 
 class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
-    # NOTE: Modal max 5 inputs → we combine idle/scouted into one
     keep_power = discord.ui.TextInput(label="Power Level of Keep", placeholder="e.g., 200m, 350m", required=True, max_length=16)
     primary_troop = discord.ui.TextInput(label="Primary Troop Type", placeholder="Cavalry / Infantry / Range", required=True, max_length=16)
     keep_level = discord.ui.TextInput(label="Keep Level", placeholder="e.g., K30, K34", required=True, max_length=8)
@@ -536,7 +594,6 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
         await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
         asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
-# SOP doesn’t need a modal; create immediately
 @rally_group.command(name="sop", description="Create a Seat of Power Rally")
 async def rally_sop(interaction: discord.Interaction):
     guild = interaction.guild
@@ -603,7 +660,6 @@ async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, re
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # when last user leaves a tracked VC -> delete immediately
     for ch in (before.channel, after.channel):
         if not isinstance(ch, discord.VoiceChannel):
             continue
@@ -628,7 +684,7 @@ async def on_ready():
     except Exception as e:
         log.exception("Failed to sync commands: %s", e)
 
-    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    log.info("Logged in as %s (%s) | ENABLE_VOICE=%s", bot.user, bot.user.id, ENABLE_VOICE)
 
 # ============================== ENTRYPOINT ==============================
 
