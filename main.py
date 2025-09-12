@@ -14,20 +14,6 @@ from dotenv import load_dotenv
 # ------------------------- Setup & Config -------------------------
 
 load_dotenv()
-from dotenv import load_dotenv
-load_dotenv()
-import os, reprlib
-
-TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
-
-print("Token present:", bool(TOKEN))
-print("Token length:", len(TOKEN) if TOKEN else None)
-if TOKEN:
-    print("Token preview:", TOKEN[:6], "...", TOKEN[-6:])  # safe preview
-
-if not TOKEN:
-    raise RuntimeError("Set DISCORD_BOT_TOKEN (or DISCORD_TOKEN).")
-
 bot.run(TOKEN)
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
