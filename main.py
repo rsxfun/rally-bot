@@ -48,6 +48,11 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # ------------------------- Setup & Config -------------------------
+import os
+GUILD_IDS = os.getenv("GUILD_IDS", "")  # e.g. "123456789012345678,987654321012345678"
+
+def _parse_guild_ids():
+    return [int(x) for x in GUILD_IDS.split(",") if x.strip().isdigit()]
 
 load_dotenv()
 bot.run(TOKEN)
