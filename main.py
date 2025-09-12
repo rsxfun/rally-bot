@@ -1,4 +1,4 @@
-# main.py — Rally Bot (voice-safe on PaaS, robust views/modals, guild sync)
+# main.py — Rally Bot (forgiving category detection, voice-safe on PaaS, robust views/modals, guild sync)
 
 import os
 import io
@@ -6,7 +6,7 @@ import csv
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Literal
+from typing import Dict, Optional, List, Literal, Tuple
 
 import discord
 from discord import app_commands
@@ -22,12 +22,12 @@ if not TOKEN:
     raise RuntimeError("Set DISCORD_BOT_TOKEN (or DISCORD_TOKEN) in your environment.")
 
 GUILD_IDS = os.getenv("GUILD_IDS", "")  # e.g. "123...,987..."
+# If this is 0 or invalid, we'll auto-detect a good category.
 TEMP_VC_CATEGORY_ID = int(os.getenv("TEMP_VC_CATEGORY_ID", "0"))
 HITTERS_ROLE_NAME = os.getenv("HITTERS_ROLE_NAME", "hitters")
 DELETE_VC_IF_EMPTY_AFTER_SECS = int(os.getenv("DELETE_VC_IF_EMPTY_AFTER_SECS", "300"))
 
 # === VOICE FEATURE FLAG ===
-# Many PaaS (incl. typical Render services) do NOT support UDP -> Discord voice will fail.
 ENABLE_VOICE = os.getenv("ENABLE_VOICE", "false").strip().lower() in ("1", "true", "yes")
 
 # Audio URLs
@@ -122,10 +122,94 @@ def ensure_int(value: str, default: int = 0) -> int:
     except Exception:
         return default
 
-async def ensure_temp_vc(guild: discord.Guild, owner: discord.Member, name_hint: str, size_hint: int) -> discord.VoiceChannel:
-    cat = guild.get_channel(TEMP_VC_CATEGORY_ID)
-    if not isinstance(cat, discord.CategoryChannel):
-        raise RuntimeError(f"Category {TEMP_VC_CATEGORY_ID} not found or not a category.")
+def _pick_category(
+    guild: discord.Guild,
+    context_channel: Optional[discord.abc.GuildChannel],
+    owner: Optional[discord.Member],
+) -> Tuple[Optional[discord.CategoryChannel], Optional[str]]:
+    """
+    Returns (category, error_message). If error_message is not None, the caller should surface it.
+    Preference order:
+      1) TEMP_VC_CATEGORY_ID if valid + is Category
+      2) context_channel.category (where command was used)
+      3) owner's current voice channel category
+      4) create a new "Rallies" category (if perms allow)
+    """
+    # 1) Explicit env
+    if TEMP_VC_CATEGORY_ID:
+        ch = guild.get_channel(TEMP_VC_CATEGORY_ID)
+        if isinstance(ch, discord.CategoryChannel):
+            return ch, None
+        # If an ID was provided but it's wrong, keep going but remember why.
+        wrong_hint = f"Configured TEMP_VC_CATEGORY_ID {TEMP_VC_CATEGORY_ID} is not a valid Category in this guild."
+
+    else:
+        wrong_hint = None
+
+    # 2) Current text channel's category
+    if isinstance(context_channel, (discord.TextChannel, discord.VoiceChannel)):
+        if context_channel.category:
+            return context_channel.category, None
+
+    # 3) Owner's voice channel category
+    if owner and owner.voice and isinstance(owner.voice.channel, discord.VoiceChannel):
+        if owner.voice.channel.category:
+            return owner.voice.channel.category, None
+
+    # 4) Try to create a category
+    try:
+        cat = asyncio.get_running_loop().create_task(guild.create_category("Rallies", reason="Rally temp VC category"))
+        # Wait for creation to complete
+        new_cat = asyncio.get_running_loop().run_until_complete(cat)  # we are already in async; cannot do this
+    except RuntimeError:
+        # We can't run nested loop; do it the normal awaited way in an async function.
+        pass
+
+    # The above "create_task + run_until_complete" can't be used inside async. Provide a small helper for async contexts.
+    return None, wrong_hint or "No suitable category found."
+
+async def pick_or_create_category(
+    guild: discord.Guild,
+    context_channel: Optional[discord.abc.GuildChannel],
+    owner: Optional[discord.Member],
+) -> discord.CategoryChannel:
+    """
+    Async wrapper around _pick_category which, if all heuristics fail, tries to create a category.
+    """
+    # Try heuristics
+    if TEMP_VC_CATEGORY_ID:
+        ch = guild.get_channel(TEMP_VC_CATEGORY_ID)
+        if isinstance(ch, discord.CategoryChannel):
+            return ch
+
+    if isinstance(context_channel, (discord.TextChannel, discord.VoiceChannel)) and context_channel.category:
+        return context_channel.category
+
+    if owner and owner.voice and isinstance(owner.voice.channel, discord.VoiceChannel) and owner.voice.channel.category:
+        return owner.voice.channel.category
+
+    # Create a new one as a last resort
+    try:
+        return await guild.create_category("Rallies", reason="Rally temp VC category")
+    except Exception as e:
+        raise RuntimeError(
+            "No valid category found and I couldn't create one. "
+            "Fix by either:\n"
+            f"• Setting a valid TEMP_VC_CATEGORY_ID to a Category in this guild, or\n"
+            f"• Running the command in a channel that belongs to a Category, or\n"
+            f"• Granting me Manage Channels so I can create a 'Rallies' category.\n\n"
+            f"Details: {e}"
+        )
+
+async def ensure_temp_vc(
+    guild: discord.Guild,
+    owner: discord.Member,
+    context_channel: Optional[discord.abc.GuildChannel],
+    name_hint: str,
+    size_hint: int
+) -> discord.VoiceChannel:
+    cat = await pick_or_create_category(guild, context_channel, owner)
+
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True),
@@ -136,7 +220,7 @@ async def ensure_temp_vc(guild: discord.Guild, owner: discord.Member, name_hint:
         category=cat,
         user_limit=size_hint if 1 <= size_hint <= 99 else 0,
         overwrites=overwrites,
-        reason="Rally temp VC",
+        reason=f"Rally temp VC ({name_hint})",
     )
     return vc
 
@@ -212,7 +296,6 @@ async def update_post(guild: discord.Guild, r: Rally):
 def _try_load_opus() -> bool:
     if discord.opus.is_loaded():
         return True
-    # Try common lib names
     for name in ("opus", "libopus.so.0", "libopus"):
         try:
             discord.opus.load_opus(name)
@@ -222,7 +305,6 @@ def _try_load_opus() -> bool:
     return False
 
 async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceClient]:
-    """Best-effort connect/move + readiness checks. Returns connected VoiceClient or None."""
     if not ENABLE_VOICE:
         return None
     if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
@@ -240,7 +322,6 @@ async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceC
         else:
             voice = await vc_target.connect(timeout=15.0, reconnect=False)
 
-        # Give a brief moment for UDP/WS to stabilise; bail if disconnected.
         for _ in range(6):
             await asyncio.sleep(0.5)
             if voice.is_connected():
@@ -250,11 +331,7 @@ async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceC
         log.exception("Voice connect/move failed: %s", e)
         return None
 
-async def play_audio_in_member_vc(member: discord.Member, url: str) -> (bool, str):
-    """
-    Tries to join user's VC and stream an mp3 via ffmpeg.
-    Returns (success, message_for_user).
-    """
+async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[bool, str]:
     if not ENABLE_VOICE:
         return False, "Voice playback is disabled on this host (ENABLE_VOICE=false)."
 
@@ -269,7 +346,6 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> (bool, st
     try:
         if voice.is_playing():
             voice.stop()
-        # ffmpeg must be installed on the system PATH
         audio = discord.FFmpegPCMAudio(url)
         voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
         return True, "Playback started."
@@ -312,7 +388,6 @@ class JoinRallyModal(discord.ui.Modal, title="Join Rally"):
             capacity_value=capacity_num
         )
 
-        # Add to private thread
         if r.private_thread_id:
             th = interaction.guild.get_thread(r.private_thread_id)  # type: ignore
             if th and not th.archived:
@@ -415,7 +490,7 @@ class ConfirmJoinVCView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True)
         ok, msg = await play_audio_in_member_vc(member, self.url_to_play)
-        await interaction.followup.send(msg if ok else msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
     async def no(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -569,7 +644,7 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
             return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
 
         try:
-            vc = await ensure_temp_vc(guild, author, "Keep Rally", 10)
+            vc = await ensure_temp_vc(guild, author, channel, "Keep Rally", 10)
         except Exception as e:
             return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
 
@@ -604,7 +679,7 @@ async def rally_sop(interaction: discord.Interaction):
         return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
 
     try:
-        vc = await ensure_temp_vc(guild, author, "SOP Rally", 10)
+        vc = await ensure_temp_vc(guild, author, channel, "SOP Rally", 10)
     except Exception as e:
         return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
 
