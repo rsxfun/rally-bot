@@ -1,4 +1,4 @@
-# main.py — Rally Bot (clean boot order, guild sync, slash groups)
+# main.py — Rally Bot (fixed modals & views, guild sync)
 
 import os
 import io
@@ -21,24 +21,20 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_BOT_TOKEN (or DISCORD_TOKEN) in your environment.")
 
-# Comma-separated list of guild IDs to sync commands instantly (recommended)
 GUILD_IDS = os.getenv("GUILD_IDS", "")  # e.g. "123456789012345678,987654321012345678"
 
 def _parse_guild_ids() -> List[int]:
     return [int(x) for x in GUILD_IDS.split(",") if x.strip().isdigit()]
 
-# Category for temp voice channels
 TEMP_VC_CATEGORY_ID = int(os.getenv("TEMP_VC_CATEGORY_ID", "0"))
-# Role name to mention on posts
 HITTERS_ROLE_NAME = os.getenv("HITTERS_ROLE_NAME", "hitters")
-# VC empty timeout (seconds) → delete
 DELETE_VC_IF_EMPTY_AFTER_SECS = int(os.getenv("DELETE_VC_IF_EMPTY_AFTER_SECS", "300"))
 
-# Audio URLs (you can host on GCS/S3/etc.)
+# Audio URLs
 AUDIO_5M_BOMB = os.getenv("AUDIO_5M_BOMB", "https://storage.googleapis.com/rallybot/5minbombcomplete.mp3")
 AUDIO_10M_BOMB = os.getenv("AUDIO_10M_BOMB", "https://storage.googleapis.com/rallybot/10minbomb.mp3")
-AUDIO_30M_BOMB = os.getenv("AUDIO_30M_BOMB", "")  # fill if available
-AUDIO_1H_BOMB  = os.getenv("AUDIO_1H_BOMB", "")   # fill if available
+AUDIO_30M_BOMB = os.getenv("AUDIO_30M_BOMB", "")
+AUDIO_1H_BOMB  = os.getenv("AUDIO_1H_BOMB", "")
 AUDIO_EXPLAIN_BOMB = os.getenv("AUDIO_EXPLAIN_BOMB", "https://storage.googleapis.com/rallybot/explainbombrally.mp3")
 
 AUDIO_5S_ROLL  = os.getenv("AUDIO_5S_ROLL", "https://storage.googleapis.com/rallybot/5secondgaps.mp3")
@@ -57,9 +53,7 @@ intents.guilds = True
 intents.members = True
 intents.voice_states = True
 
-allowed_mentions = discord.AllowedMentions(everyone=False, users=True, roles=True)
-
-bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=allowed_mentions)
+bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=True))
 tree = bot.tree
 
 # ============================== DATA MODELS ==============================
@@ -73,7 +67,7 @@ class Participant:
     troop_type: TroopType
     troop_tier: TroopTier
     rally_dragon: bool
-    capacity_value: int  # numeric
+    capacity_value: int
 
 @dataclass
 class Rally:
@@ -83,15 +77,13 @@ class Rally:
     creator_id: int
     rally_kind: Literal["KEEP", "SOP"]
 
-    # Keep Rally details
+    # Keep fields (max 5 per modal → we keep 5 below)
     keep_power: Optional[str] = None
     primary_troop: Optional[TroopType] = None
     keep_level: Optional[str] = None
     gear_worn: Optional[str] = None
-    idle_time: Optional[str] = None
-    scouted: Optional[str] = None
+    idle_and_scouted: Optional[str] = None  # combined to respect modal limit
 
-    # dynamic resources
     temp_vc_id: Optional[int] = None
     temp_vc_invite_url: Optional[str] = None
     private_thread_id: Optional[int] = None
@@ -105,7 +97,7 @@ class Rally:
 
 # message_id -> Rally
 RALLIES: Dict[int, Rally] = {}
-# voice_channel_id -> message_id (for cleanup, reverse lookup)
+# voice_channel_id -> message_id
 VC_TO_POST: Dict[int, int] = {}
 
 # ============================== UTILITIES ==============================
@@ -167,8 +159,7 @@ def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
         e.add_field(name="Primary Troop Type", value=r.primary_troop or "—", inline=True)
         e.add_field(name="Keep Level", value=r.keep_level or "—", inline=True)
         e.add_field(name="Gear Worn", value=r.gear_worn or "—", inline=True)
-        e.add_field(name="Idle Time", value=r.idle_time or "—", inline=True)
-        e.add_field(name="Scouted?", value=r.scouted or "—", inline=True)
+        e.add_field(name="Idle / Scouted", value=r.idle_and_scouted or "—", inline=True)
 
     if r.temp_vc_id:
         ch = guild.get_channel(r.temp_vc_id)
@@ -190,7 +181,6 @@ async def dm_join_info(member: discord.Member, r: Rally, sop: bool):
     vc = guild.get_channel(r.temp_vc_id)
     if not isinstance(vc, discord.VoiceChannel):
         return
-    # single-use, 1 hour
     invite = await vc.create_invite(max_age=3600, max_uses=1, unique=True, reason="Rally user join")
     turl = thread_link(r.guild_id, r.private_thread_id) if r.private_thread_id else None
     text = f"You joined the **{'SOP' if sop else 'Keep'} Rally**.\nVoice: {invite.url}"
@@ -210,8 +200,7 @@ async def update_post(guild: discord.Guild, r: Rally):
         msg = await ch.fetch_message(r.message_id)
     except Exception:
         return
-    view = build_rally_view(r)
-    await msg.edit(embed=embed_for_rally(guild, r), view=view)
+    await msg.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
 
 # ============================== VIEWS & MODALS ==============================
 
@@ -331,9 +320,6 @@ def build_rally_view(r: Rally) -> discord.ui.View:
 type_group = app_commands.Group(name="type_of_rally", description="Bomb rallies, Rolling rallies, explanations")
 tree.add_command(type_group)
 
-def simple_choice_embed(title: str, description: str) -> discord.Embed:
-    return discord.Embed(title=title, description=description, color=discord.Color.blurple())
-
 class ConfirmJoinVCView(discord.ui.View):
     def __init__(self, url_label: str, url_to_play: str):
         super().__init__(timeout=120)
@@ -357,12 +343,10 @@ class ConfirmJoinVCView(discord.ui.View):
         await interaction.response.send_message("Cancelled.", ephemeral=True)
 
 async def play_audio_in_member_vc(member: discord.Member, url: str) -> bool:
-    """Join member's current VC and play an MP3 from a URL using ffmpeg."""
     if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
         return False
     vc_channel = member.voice.channel
     try:
-        voice: discord.VoiceClient
         if member.guild.voice_client and member.guild.voice_client.is_connected():
             voice = member.guild.voice_client
             if voice.channel != vc_channel:
@@ -378,113 +362,132 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> bool:
         log.exception("Play error: %s", e)
         return False
 
-# ---- Bomb Rallies
+class BombMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="5 Minute Bomb", style=discord.ButtonStyle.danger)
+    async def b5(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("5m Bomb", AUDIO_5M_BOMB),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="10 Minute Bomb", style=discord.ButtonStyle.danger)
+    async def b10(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("10m Bomb", AUDIO_10M_BOMB),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="30 Minute Bomb", style=discord.ButtonStyle.danger)
+    async def b30(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("30m Bomb", AUDIO_30M_BOMB),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="1 Hour Bomb", style=discord.ButtonStyle.danger)
+    async def b60(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose where to explain/run:",
+            view=ExplainOrStartView("1h Bomb", AUDIO_1H_BOMB),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Explain Bomb Rally", style=discord.ButtonStyle.success)
+    async def bexplain(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start the explanation. Continue?",
+            view=ConfirmJoinVCView("Explain Bomb Rally", AUDIO_EXPLAIN_BOMB),
+            ephemeral=True
+        )
+
+class ExplainOrStartView(discord.ui.View):
+    def __init__(self, label: str, url: str):
+        super().__init__(timeout=120)
+        self.label = label
+        self.url = url
+
+    @discord.ui.button(label="Start on VC", style=discord.ButtonStyle.danger)
+    async def start(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start the countdown. Continue?",
+            view=ConfirmJoinVCView(self.label, self.url),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Explain on VC", style=discord.ButtonStyle.success)
+    async def explain_vc(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start the explanation. Continue?",
+            view=ConfirmJoinVCView(self.label, self.url),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Explain in Text", style=discord.ButtonStyle.primary)
+    async def explain_text(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            f"**{self.label}**:\n- Join VC.\n- Follow timing as instructed.\n",
+            ephemeral=True
+        )
+
 @type_group.command(name="bomb", description="Bomb Rally options")
 async def type_bomb(interaction: discord.Interaction):
-    e = simple_choice_embed("💣 Bomb Rally", "Pick an option below.")
-    view = discord.ui.View(timeout=300)
+    e = discord.Embed(title="💣 Bomb Rally", description="Pick an option below.", color=discord.Color.blurple())
+    await interaction.response.send_message(embed=e, view=BombMenuView(), ephemeral=True)
 
-    async def confirm(inter: discord.Interaction, label: str, url: str):
-        await inter.response.send_message(
-            "The bot will join your current VC and start the countdown. Continue?",
-            view=ConfirmJoinVCView(label, url),
+class RollingMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="5 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s5(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start. Continue?",
+            view=ConfirmJoinVCView("5s Intervals", AUDIO_5S_ROLL),
             ephemeral=True
         )
 
-    # Buttons
-    async def _5m(i):  await i.response.send_message("Choose where to explain/run:", view=make_explain_or_start_view("5m Bomb", AUDIO_5M_BOMB), ephemeral=True)
-    async def _10m(i): await i.response.send_message("Choose where to explain/run:", view=make_explain_or_start_view("10m Bomb", AUDIO_10M_BOMB), ephemeral=True)
-    async def _30m(i): await i.response.send_message("Choose where to explain/run:", view=make_explain_or_start_view("30m Bomb", AUDIO_30M_BOMB), ephemeral=True)
-    async def _1h(i):  await i.response.send_message("Choose where to explain/run:", view=make_explain_or_start_view("1h Bomb", AUDIO_1H_BOMB), ephemeral=True)
-    async def _exp(i): await confirm(i, "Explain Bomb Rally", AUDIO_EXPLAIN_BOMB)
-
-    view.add_item(discord.ui.Button(label="5 Minute Bomb", style=discord.ButtonStyle.danger, custom_id="bomb_5"))
-    view.add_item(discord.ui.Button(label="10 Minute Bomb", style=discord.ButtonStyle.danger, custom_id="bomb_10"))
-    view.add_item(discord.ui.Button(label="30 Minute Bomb", style=discord.ButtonStyle.danger, custom_id="bomb_30"))
-    view.add_item(discord.ui.Button(label="1 Hour Bomb", style=discord.ButtonStyle.danger, custom_id="bomb_60"))
-    view.add_item(discord.ui.Button(label="Explain Bomb Rally", style=discord.ButtonStyle.success, custom_id="bomb_explain"))
-
-    async def on_interaction(inter: discord.Interaction):
-        if not inter.data or "custom_id" not in inter.data:
-            return
-        cid = inter.data["custom_id"]
-        if cid == "bomb_5":  return await _5m(inter)
-        if cid == "bomb_10": return await _10m(inter)
-        if cid == "bomb_30": return await _30m(inter)
-        if cid == "bomb_60": return await _1h(inter)
-        if cid == "bomb_explain": return await _exp(inter)
-
-    view.on_timeout = lambda: None  # quiet
-    view.interaction_check = lambda i: True  # allow anyone
-
-    # monkey-patch to route clicks (discord.py doesn't provide a native router for ad-hoc buttons)
-    async def _dispatch(i):
-        await on_interaction(i)
-    view._scheduled_task = None
-    view._dispatch = _dispatch  # type: ignore
-
-    await interaction.response.send_message(embed=e, view=view, ephemeral=True)
-
-def make_explain_or_start_view(label: str, url: str) -> discord.ui.View:
-    v = discord.ui.View(timeout=120)
-    async def confirm(inter: discord.Interaction):
-        await inter.response.send_message(
-            "The bot will join your current VC and start the countdown. Continue?",
-            view=ConfirmJoinVCView(label, url),
+    @discord.ui.button(label="10 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s10(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start. Continue?",
+            view=ConfirmJoinVCView("10s Intervals", AUDIO_10S_ROLL),
             ephemeral=True
         )
-    v.add_item(discord.ui.Button(label=f"Start {label} on VC", style=discord.ButtonStyle.danger, custom_id=f"start_{label}"))
-    v.add_item(discord.ui.Button(label="Explain on VC", style=discord.ButtonStyle.success, custom_id=f"expl_vc_{label}"))
-    v.add_item(discord.ui.Button(label="Explain in Text", style=discord.ButtonStyle.primary, custom_id=f"expl_txt_{label}"))
 
-    async def on_interaction(inter: discord.Interaction):
-        cid = inter.data.get("custom_id")
-        if cid and (cid.startswith("start_") or cid.startswith("expl_vc_")):
-            return await confirm(inter)
-        if cid and cid.startswith("expl_txt_"):
-            return await inter.response.send_message(f"**{label}**:\n- Join VC.\n- Follow timing as instructed.\n", ephemeral=True)
-    async def _dispatch(i):
-        await on_interaction(i)
-    v._dispatch = _dispatch  # type: ignore
-    return v
+    @discord.ui.button(label="15 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s15(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start. Continue?",
+            view=ConfirmJoinVCView("15s Intervals", AUDIO_15S_ROLL),
+            ephemeral=True
+        )
 
-# ---- Rolling Rallies
+    @discord.ui.button(label="30 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s30(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start. Continue?",
+            view=ConfirmJoinVCView("30s Intervals", AUDIO_30S_ROLL),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Explain Rolling Rally", style=discord.ButtonStyle.success)
+    async def rexplain(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message(
+            "The bot will join your current VC and start the explanation. Continue?",
+            view=ConfirmJoinVCView("Explain Rolling Rally", AUDIO_EXPLAIN_ROLL),
+            ephemeral=True
+        )
+
 @type_group.command(name="rolling", description="Rolling Rally options")
 async def type_rolling(interaction: discord.Interaction):
-    e = simple_choice_embed("🔁 Rolling Rally", "Pick an option below.")
-    view = discord.ui.View(timeout=300)
-
-    async def confirm(inter: discord.Interaction, label: str, url: str):
-        await inter.response.send_message(
-            "The bot will join your current VC and start.",
-            view=ConfirmJoinVCView(label, url),
-            ephemeral=True
-        )
-
-    async def _5s(i):  await confirm(i, "5s Intervals", AUDIO_5S_ROLL)
-    async def _10s(i): await confirm(i, "10s Intervals", AUDIO_10S_ROLL)
-    async def _15s(i): await confirm(i, "15s Intervals", AUDIO_15S_ROLL)
-    async def _30s(i): await confirm(i, "30s Intervals", AUDIO_30S_ROLL)
-    async def _exp(i): await confirm(i, "Explain Rolling Rally", AUDIO_EXPLAIN_ROLL)
-
-    view.add_item(discord.ui.Button(label="5 Second Intervals", style=discord.ButtonStyle.danger, custom_id="roll_5"))
-    view.add_item(discord.ui.Button(label="10 Second Intervals", style=discord.ButtonStyle.danger, custom_id="roll_10"))
-    view.add_item(discord.ui.Button(label="15 Second Intervals", style=discord.ButtonStyle.danger, custom_id="roll_15"))
-    view.add_item(discord.ui.Button(label="30 Second Intervals", style=discord.ButtonStyle.danger, custom_id="roll_30"))
-    view.add_item(discord.ui.Button(label="Explain Rolling Rally", style=discord.ButtonStyle.success, custom_id="roll_exp"))
-
-    async def on_interaction(inter: discord.Interaction):
-        cid = inter.data.get("custom_id")
-        if cid == "roll_5":  return await _5s(inter)
-        if cid == "roll_10": return await _10s(inter)
-        if cid == "roll_15": return await _15s(inter)
-        if cid == "roll_30": return await _30s(inter)
-        if cid == "roll_exp": return await _exp(inter)
-    async def _dispatch(i):
-        await on_interaction(i)
-    view._dispatch = _dispatch  # type: ignore
-
-    await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+    e = discord.Embed(title="🔁 Rolling Rally", description="Pick an option below.", color=discord.Color.blurple())
+    await interaction.response.send_message(embed=e, view=RollingMenuView(), ephemeral=True)
 
 # ============================== /rally GROUP ==============================
 
@@ -492,12 +495,12 @@ rally_group = app_commands.Group(name="rally", description="Create a Keep Rally 
 tree.add_command(rally_group)
 
 class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
+    # NOTE: Modal max 5 inputs → we combine idle/scouted into one
     keep_power = discord.ui.TextInput(label="Power Level of Keep", placeholder="e.g., 200m, 350m", required=True, max_length=16)
     primary_troop = discord.ui.TextInput(label="Primary Troop Type", placeholder="Cavalry / Infantry / Range", required=True, max_length=16)
     keep_level = discord.ui.TextInput(label="Keep Level", placeholder="e.g., K30, K34", required=True, max_length=8)
     gear_worn = discord.ui.TextInput(label="What Gear is Worn", placeholder="Farming / Crafting / Attack / Defense", required=True, max_length=32)
-    idle_time = discord.ui.TextInput(label="Idle Time", placeholder="e.g., 10 Minutes, 30 Minutes", required=True, max_length=32)
-    scouted = discord.ui.TextInput(label="Scouted?", placeholder="Yes 20 minutes ago, No", required=True, max_length=64)
+    idle_and_scouted = discord.ui.TextInput(label="Idle Time & Scouted?", placeholder="e.g., Idle 10m, Scouted 20m ago / No", required=True, max_length=64)
 
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
@@ -522,11 +525,9 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
             primary_troop=self.primary_troop.value.strip().title(),  # type: ignore
             keep_level=self.keep_level.value.strip().upper(),
             gear_worn=self.gear_worn.value.strip(),
-            idle_time=self.idle_time.value.strip(),
-            scouted=self.scouted.value.strip(),
+            idle_and_scouted=self.idle_and_scouted.value.strip(),
             temp_vc_id=vc.id, temp_vc_invite_url=invite_url, private_thread_id=thread.id
         )
-        # Optional: add host placeholder to roster
         r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
         RALLIES[dummy.id] = r
         VC_TO_POST[vc.id] = dummy.id
@@ -535,43 +536,40 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
         await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
         asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
-class SOPForm(discord.ui.Modal, title="Seat of Power Rally"):
-    async def on_submit(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        channel = interaction.channel
-        author: discord.Member = interaction.user  # type: ignore
+# SOP doesn’t need a modal; create immediately
+@rally_group.command(name="sop", description="Create a Seat of Power Rally")
+async def rally_sop(interaction: discord.Interaction):
+    guild = interaction.guild
+    channel = interaction.channel
+    author: discord.Member = interaction.user  # type: ignore
 
-        if not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
 
-        try:
-            vc = await ensure_temp_vc(guild, author, "SOP Rally", 10)
-        except Exception as e:
-            return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
+    try:
+        vc = await ensure_temp_vc(guild, author, "SOP Rally", 10)
+    except Exception as e:
+        return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
 
-        invite_url = await create_or_refresh_vc_invite(vc)
-        thread = await create_thread_for_rally(channel, "🧵 SOP Rally Thread", author)
+    invite_url = await create_or_refresh_vc_invite(vc)
+    thread = await create_thread_for_rally(channel, "🧵 SOP Rally Thread", author)
 
-        dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
-        r = Rally(
-            message_id=dummy.id, guild_id=guild.id, channel_id=channel.id, creator_id=author.id, rally_kind="SOP",
-            temp_vc_id=vc.id, temp_vc_invite_url=invite_url, private_thread_id=thread.id
-        )
-        r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
-        RALLIES[dummy.id] = r
-        VC_TO_POST[vc.id] = dummy.id
+    dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
+    r = Rally(
+        message_id=dummy.id, guild_id=guild.id, channel_id=channel.id, creator_id=author.id, rally_kind="SOP",
+        temp_vc_id=vc.id, temp_vc_invite_url=invite_url, private_thread_id=thread.id
+    )
+    r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
+    RALLIES[dummy.id] = r
+    VC_TO_POST[vc.id] = dummy.id
 
-        await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
-        await interaction.response.send_message(f"SOP Rally posted in {channel.mention}.", ephemeral=True)
-        asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
+    await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+    await interaction.response.send_message(f"SOP Rally posted in {channel.mention}.", ephemeral=True)
+    asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
 @rally_group.command(name="keep", description="Create a Keep Rally (form)")
 async def rally_keep(interaction: discord.Interaction):
     await interaction.response.send_modal(KeepForm())
-
-@rally_group.command(name="sop", description="Create a Seat of Power Rally")
-async def rally_sop(interaction: discord.Interaction):
-    await interaction.response.send_modal(SOPForm())
 
 # ============================== VC CLEANUP ==============================
 
@@ -592,7 +590,6 @@ async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, re
         pass
     if mid and mid in RALLIES:
         r = RALLIES[mid]
-        # archive thread
         if r.private_thread_id:
             th = guild.get_thread(r.private_thread_id)
             if th and not th.archived:
@@ -622,12 +619,10 @@ async def on_ready():
     try:
         guild_ids = _parse_guild_ids()
         if guild_ids:
-            # Instant guild sync
             for gid in guild_ids:
                 await tree.sync(guild=discord.Object(id=gid))
             log.info("Slash commands synced to %d guild(s): %s", len(guild_ids), guild_ids)
         else:
-            # Global sync (propagation may take up to ~1 hour)
             cmds = await tree.sync()
             log.info("Globally synced %d commands.", len(cmds))
     except Exception as e:
