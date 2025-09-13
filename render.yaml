@@ -1,0 +1,33 @@
+services:
+  - type: worker
+    name: rally-bot
+    runtime: python
+    region: oregon         # or your region
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false       # set in Render UI on first deploy
+      - key: ENABLE_VOICE
+        value: "false"    # Render cannot do Discord Voice (UDP)
+      - key: TEMP_VC_CATEGORY_ID
+        sync: false
+      - key: HITTERS_ROLE_NAME
+        value: hitters
+      - key: DELETE_VC_IF_EMPTY_AFTER_SECS
+        value: "300"
+      - key: AUDIO_5M_BOMB
+        value: https://storage.googleapis.com/rallybot/5minbombcomplete.mp3
+      - key: AUDIO_10M_BOMB
+        value: https://storage.googleapis.com/rallybot/10minbomb.mp3
+      - key: AUDIO_EXPLAIN_BOMB
+        value: https://storage.googleapis.com/rallybot/explainbombrally.mp3
+      - key: AUDIO_5S_ROLL
+        value: https://storage.googleapis.com/rallybot/5secondgaps.mp3
+      - key: AUDIO_10S_ROLL
+        value: https://storage.googleapis.com/rallybot/10secondgaps.mp3
+      - key: AUDIO_15S_ROLL
+        value: https://storage.googleapis.com/rallybot/15secondgaps.mp3
+      - key: AUDIO_30S_ROLL
+        value: https://storage.googleapis.com/rallybot/30secondgaps.mp3
