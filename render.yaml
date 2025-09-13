@@ -10,7 +10,7 @@ services:
       - key: DISCORD_BOT_TOKEN
         sync: false       # set in Render UI on first deploy
       - key: ENABLE_VOICE
-        value: "false"    # Render cannot do Discord Voice (UDP)
+        value: "True"    # Render cannot do Discord Voice (UDP)
       - key: TEMP_VC_CATEGORY_ID
         sync: false
       - key: HITTERS_ROLE_NAME
