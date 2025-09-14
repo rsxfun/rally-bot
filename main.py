@@ -240,7 +240,7 @@ async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
 
 def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
     title = "🏰 Keep Rally" if r.rally_kind == "KEEP" else "🛡️ Seat of Power Rally"
-    e = discord.Embed(title=title, color=discord.Color.blurple())  # <- NO description!
+    e = discord.Embed(title=title, color=discord.Color.blurple())
 
     creator = guild.get_member(r.creator_id)
     e.add_field(name="Host", value=(creator.mention if creator else f"<@{r.creator_id}>"), inline=True)
