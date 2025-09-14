@@ -240,10 +240,9 @@ async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
 
 def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
     title = "🏰 Keep Rally" if r.rally_kind == "KEEP" else "🛡️ Seat of Power Rally"
-    desc = f"{role_mention(guild, HITTERS_ROLE_NAME)} — Don't forget to use `/type_of_rally` for Bomb/Rolling!"
-    e = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
-    creator = guild.get_member(r.creator_id)
-    e.add_field(name="Host", value=(creator.mention if creator else f"<@{r.creator_id}>"), inline=True)
+    # was: desc = f"{role_mention(...)} — Don't forget ..."
+    # and: discord.Embed(title=title, description=desc, color=...)
+    e = discord.Embed(title=title, color=discord.Color.blurple())
 
     if r.rally_kind == "KEEP":
         e.add_field(name="Power Level of Keep", value=r.keep_power or "—", inline=True)
@@ -665,9 +664,15 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
         RALLIES[dummy.id] = r
         VC_TO_POST[vc.id] = dummy.id
 
-        await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
-        await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
-        asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
+       await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+
+await channel.send(
+    f"{role_mention(guild, HITTERS_ROLE_NAME)} — Don’t forget to use `/type_of_rally` for Bomb/Rolling!",
+    allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True)
+)
+
+await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
+asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
 @rally_group.command(name="sop", description="Create a Seat of Power Rally")
 async def rally_sop(interaction: discord.Interaction):
@@ -696,6 +701,10 @@ async def rally_sop(interaction: discord.Interaction):
     VC_TO_POST[vc.id] = dummy.id
 
     await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+    await channel.send(
+    f"{role_mention(guild, HITTERS_ROLE_NAME)} — Don’t forget to use `/type_of_rally` for Bomb/Rolling!",
+    allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True)
+)
     await interaction.response.send_message(f"SOP Rally posted in {channel.mention}.", ephemeral=True)
     asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
