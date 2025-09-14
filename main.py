@@ -1,5 +1,3 @@
-# main.py — Rally Bot (no threads, robust VC join, role-ping CTA message, roster-as-message)
-
 import os
 import io
 import asyncio
