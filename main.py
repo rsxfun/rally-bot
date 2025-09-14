@@ -1,8 +1,7 @@
-# main.py — Rally Bot (forgiving category detection, voice-safe on PaaS, robust views/modals, guild sync)
+# main.py — Rally Bot (no threads, robust VC join, role-ping CTA message, roster-as-message)
 
 import os
 import io
-import csv
 import asyncio
 import logging
 from dataclasses import dataclass, field
@@ -22,12 +21,11 @@ if not TOKEN:
     raise RuntimeError("Set DISCORD_BOT_TOKEN (or DISCORD_TOKEN) in your environment.")
 
 GUILD_IDS = os.getenv("GUILD_IDS", "")  # e.g. "123...,987..."
-# If this is 0 or invalid, we'll auto-detect a good category.
 TEMP_VC_CATEGORY_ID = int(os.getenv("TEMP_VC_CATEGORY_ID", "0"))
 HITTERS_ROLE_NAME = os.getenv("HITTERS_ROLE_NAME", "hitters")
 DELETE_VC_IF_EMPTY_AFTER_SECS = int(os.getenv("DELETE_VC_IF_EMPTY_AFTER_SECS", "300"))
 
-# === VOICE FEATURE FLAG ===
+# Voice feature flag (requires ffmpeg + libopus on host)
 ENABLE_VOICE = os.getenv("ENABLE_VOICE", "false").strip().lower() in ("1", "true", "yes")
 
 # Audio URLs
@@ -53,8 +51,8 @@ log = logging.getLogger("rally-bot")
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True
-intents.voice_states = True
+intents.members = True       # for display names on roster
+intents.voice_states = True  # for VC auto-delete
 
 bot = commands.Bot(
     command_prefix="!",
@@ -84,7 +82,6 @@ class Rally:
     creator_id: int
     rally_kind: Literal["KEEP", "SOP"]
 
-    # Keep fields (modal max=5 -> combine idle/scouted)
     keep_power: Optional[str] = None
     primary_troop: Optional[TroopType] = None
     keep_level: Optional[str] = None
@@ -93,7 +90,6 @@ class Rally:
 
     temp_vc_id: Optional[int] = None
     temp_vc_invite_url: Optional[str] = None
-    private_thread_id: Optional[int] = None
 
     participants: Dict[int, Participant] = field(default_factory=dict)
 
@@ -109,20 +105,19 @@ VC_TO_POST: Dict[int, int] = {}
 
 # ============================== UTILITIES ==============================
 
-from typing import Tuple  # make sure this import exists
-
 def role_mention(guild: discord.Guild, role_name: str) -> str:
     r = discord.utils.find(lambda rr: rr.name.lower() == role_name.lower(), guild.roles)
     return r.mention if r else f"@{role_name}"
 
 def rally_cta_text(guild: discord.Guild) -> Tuple[str, discord.AllowedMentions]:
     text = (
-        f"{role_mention(guild, HITTERS_ROLE_NAME)} there is a rally being formed!\n"
+        f"{role_mention(guild, HITTERS_ROLE_NAME)} how are y'all doing? A rally is being formed!\n"
         "Sign up by clicking **Join Rally**, complete the form and you're in!\n"
         "Don't forget to form your rally and, once you do, use "
         "`/type_of_rally rolling` or `/type_of_rally bomb` to set up the countdown you want!"
     )
-    mentions = discord.AllowedMentions(everyone=False, users=False, roles=True)  # allow role pings only
+    # allow role pings only (no user mass pings)
+    mentions = discord.AllowedMentions(everyone=False, users=False, roles=True)
     return text, mentions
 
 def ensure_int(value: str, default: int = 0) -> int:
@@ -131,84 +126,27 @@ def ensure_int(value: str, default: int = 0) -> int:
     except Exception:
         return default
 
-def _pick_category(
-    guild: discord.Guild,
-    context_channel: Optional[discord.abc.GuildChannel],
-    owner: Optional[discord.Member],
-) -> Tuple[Optional[discord.CategoryChannel], Optional[str]]:
-    """
-    Returns (category, error_message). If error_message is not None, the caller should surface it.
-    Preference order:
-      1) TEMP_VC_CATEGORY_ID if valid + is Category
-      2) context_channel.category (where command was used)
-      3) owner's current voice channel category
-      4) create a new "Rallies" category (if perms allow)
-    """
-    # 1) Explicit env
-    if TEMP_VC_CATEGORY_ID:
-        ch = guild.get_channel(TEMP_VC_CATEGORY_ID)
-        if isinstance(ch, discord.CategoryChannel):
-            return ch, None
-        # If an ID was provided but it's wrong, keep going but remember why.
-        wrong_hint = f"Configured TEMP_VC_CATEGORY_ID {TEMP_VC_CATEGORY_ID} is not a valid Category in this guild."
-
-    else:
-        wrong_hint = None
-
-    # 2) Current text channel's category
-    if isinstance(context_channel, (discord.TextChannel, discord.VoiceChannel)):
-        if context_channel.category:
-            return context_channel.category, None
-
-    # 3) Owner's voice channel category
-    if owner and owner.voice and isinstance(owner.voice.channel, discord.VoiceChannel):
-        if owner.voice.channel.category:
-            return owner.voice.channel.category, None
-
-    # 4) Try to create a category
-    try:
-        cat = asyncio.get_running_loop().create_task(guild.create_category("Rallies", reason="Rally temp VC category"))
-        # Wait for creation to complete
-        new_cat = asyncio.get_running_loop().run_until_complete(cat)  # we are already in async; cannot do this
-    except RuntimeError:
-        # We can't run nested loop; do it the normal awaited way in an async function.
-        pass
-
-    # The above "create_task + run_until_complete" can't be used inside async. Provide a small helper for async contexts.
-    return None, wrong_hint or "No suitable category found."
-
 async def pick_or_create_category(
     guild: discord.Guild,
     context_channel: Optional[discord.abc.GuildChannel],
     owner: Optional[discord.Member],
 ) -> discord.CategoryChannel:
-    """
-    Async wrapper around _pick_category which, if all heuristics fail, tries to create a category.
-    """
-    # Try heuristics
+    # 1) explicit env category
     if TEMP_VC_CATEGORY_ID:
         ch = guild.get_channel(TEMP_VC_CATEGORY_ID)
         if isinstance(ch, discord.CategoryChannel):
             return ch
 
+    # 2) the channel where command was run
     if isinstance(context_channel, (discord.TextChannel, discord.VoiceChannel)) and context_channel.category:
         return context_channel.category
 
+    # 3) owner's current VC category
     if owner and owner.voice and isinstance(owner.voice.channel, discord.VoiceChannel) and owner.voice.channel.category:
         return owner.voice.channel.category
 
-    # Create a new one as a last resort
-    try:
-        return await guild.create_category("Rallies", reason="Rally temp VC category")
-    except Exception as e:
-        raise RuntimeError(
-            "No valid category found and I couldn't create one. "
-            "Fix by either:\n"
-            f"• Setting a valid TEMP_VC_CATEGORY_ID to a Category in this guild, or\n"
-            f"• Running the command in a channel that belongs to a Category, or\n"
-            f"• Granting me Manage Channels so I can create a 'Rallies' category.\n\n"
-            f"Details: {e}"
-        )
+    # 4) last resort: create a category
+    return await guild.create_category("Rallies", reason="Rally temp VC category")
 
 async def ensure_temp_vc(
     guild: discord.Guild,
@@ -233,23 +171,12 @@ async def ensure_temp_vc(
     )
     return vc
 
-async def create_thread_for_rally(channel: discord.TextChannel, title: str, host: discord.Member) -> discord.Thread:
-    thread = await channel.create_thread(
-        name=title,
-        type=discord.ChannelType.private_thread,
-        auto_archive_duration=1440,
-        reason="Rally thread"
-    )
-    await thread.add_user(host)
-    return thread
-
 async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
     invite = await vc.create_invite(max_age=0, max_uses=0, unique=True, reason="Rally VC button")
     return invite.url
 
 def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
     title = "🏰 Keep Rally" if r.rally_kind == "KEEP" else "🛡️ Seat of Power Rally"
-    # previously this used: desc = f"{role_mention(...)}..." and description=desc
     e = discord.Embed(title=title, color=discord.Color.blurple())
 
     creator = guild.get_member(r.creator_id)
@@ -266,25 +193,18 @@ def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
         ch = guild.get_channel(r.temp_vc_id)
         if isinstance(ch, discord.VoiceChannel):
             e.add_field(name="Voice Channel", value=ch.mention, inline=False)
-    if r.private_thread_id:
-        th = guild.get_thread(r.private_thread_id)
-        if th:
-            e.add_field(name="Party Thread", value=th.mention, inline=False)
 
     e.add_field(name="Roster", value=r.roster_mentions(), inline=False)
     return e
 
-async def dm_join_info(member: discord.Member, r: Rally, sop: bool):
+async def dm_join_info(member: discord.Member, r: Rally):
     if not r.temp_vc_id:
         return
     vc = member.guild.get_channel(r.temp_vc_id)
     if not isinstance(vc, discord.VoiceChannel):
         return
     invite = await vc.create_invite(max_age=3600, max_uses=1, unique=True, reason="Rally user join")
-    turl = thread_link(r.guild_id, r.private_thread_id) if r.private_thread_id else None
-    text = f"You joined the **{'SOP' if sop else 'Keep'} Rally**.\nVoice: {invite.url}"
-    if turl:
-        text += f"\nThread: {turl}"
+    text = f"You joined the **{r.rally_kind} Rally**.\nVoice: {invite.url}"
     try:
         dm = await member.create_dm()
         await dm.send(text)
@@ -320,26 +240,27 @@ async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceC
     if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
         return None
     if not _try_load_opus():
-        log.error("Opus failed to load. Install system libopus or PyNaCl.")
+        log.error("Opus failed to load (install libopus).")
         return None
 
     vc_target = member.voice.channel
     try:
         voice = member.guild.voice_client
         if voice and voice.is_connected():
-            if voice.channel != vc_target:
+            if voice.channel.id != vc_target.id:
                 await voice.move_to(vc_target)
         else:
-            voice = await vc_target.connect(timeout=15.0, reconnect=False)
+            voice = await vc_target.connect(timeout=30.0, reconnect=True)
 
-        for _ in range(6):
-            await asyncio.sleep(0.5)
+        # Wait until connected (up to ~10s)
+        for _ in range(40):
             if voice.is_connected():
                 return voice
-        return None
+            await asyncio.sleep(0.25)
     except Exception as e:
         log.exception("Voice connect/move failed: %s", e)
-        return None
+
+    return None
 
 async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[bool, str]:
     if not ENABLE_VOICE:
@@ -398,18 +319,9 @@ class JoinRallyModal(discord.ui.Modal, title="Join Rally"):
             capacity_value=capacity_num
         )
 
-        if r.private_thread_id:
-            th = interaction.guild.get_thread(r.private_thread_id)  # type: ignore
-            if th and not th.archived:
-                try:
-                    await th.add_user(interaction.user)
-                    await th.send(f"{interaction.user.mention} joined the rally.")
-                except Exception:
-                    pass
-
-        await dm_join_info(interaction.user, r, sop=self.sop)
+        await dm_join_info(interaction.user, r)
         await update_post(interaction.guild, r)  # type: ignore
-        await interaction.response.send_message("You're on the roster. Check DMs for VC + thread.", ephemeral=True)
+        await interaction.response.send_message("You're on the roster. Check DMs for VC info.", ephemeral=True)
 
 def build_rally_view(r: Rally) -> discord.ui.View:
     class RallyView(discord.ui.View):
@@ -432,43 +344,33 @@ def build_rally_view(r: Rally) -> discord.ui.View:
 
             parts: List[Participant] = sorted(r.participants.values(), key=lambda p: p.capacity_value, reverse=True)
 
-            # CSV
-            buf = io.StringIO()
-            w = csv.writer(buf)
-            w.writerow(["User", "Troop Type", "Troop Tier", "Rally Dragon", "Capacity"])
-            for p in parts:
-                w.writerow([f"@{p.user_id}", p.troop_type, p.troop_tier, "Yes" if p.rally_dragon else "No", p.capacity_value])
+            if not parts:
+                return await interaction.response.send_message("Roster is empty.", ephemeral=True)
 
-            # Sectioned text
-            buf2 = io.StringIO()
-            def section(title: str):
-                buf2.write(f"\n=== {title} ===\n")
-            for tt in ("Cavalry", "Infantry", "Range"):
-                section(f"Troop Type: {tt}")
-                for p in parts:
-                    if p.troop_type == tt:
-                        buf2.write(f"<@{p.user_id}> | Tier {p.troop_tier} | Dragon: {'Yes' if p.rally_dragon else 'No'} | Cap: {p.capacity_value}\n")
-            for tier in ("T12", "T11", "T10", "T9", "T8"):
-                section(f"Troop Tier: {tier}")
-                for p in parts:
-                    if p.troop_tier == tier:
-                        buf2.write(f"<@{p.user_id}> | {p.troop_type} | Dragon: {'Yes' if p.rally_dragon else 'No'} | Cap: {p.capacity_value}\n")
-            section("Rally Dragon: Yes")
+            # Build a readable, line-based roster using display names
+            lines: List[str] = []
             for p in parts:
-                if p.rally_dragon:
-                    buf2.write(f"<@{p.user_id}> | {p.troop_type} {p.troop_tier} | Cap: {p.capacity_value}\n")
-            section("Capacity (High → Low)")
-            for p in parts:
-                buf2.write(f"<@{p.user_id}> | {p.troop_type} {p.troop_tier} | Dragon: {'Yes' if p.rally_dragon else 'No'} | Cap: {p.capacity_value}\n")
+                m = interaction.guild.get_member(p.user_id)  # type: ignore
+                name = (m.display_name if m else f"<@{p.user_id}>")
+                lines.append(f"{name} | {p.troop_type} {p.troop_tier} | Dragon: {'Yes' if p.rally_dragon else 'No'} | Cap: {p.capacity_value}")
 
-            await interaction.response.send_message(
-                "Exported roster.",
-                files=[
-                    discord.File(io.BytesIO(buf.getvalue().encode("utf-8")), filename="rally_roster.csv"),
-                    discord.File(io.BytesIO(buf2.getvalue().encode("utf-8")), filename="rally_roster.txt"),
-                ],
-                ephemeral=True
-            )
+            header = "**Rally Roster (by capacity)**"
+            body = "\n".join(lines)
+            text = f"{header}\n```text\n{body}\n```"
+
+            # Chunk to satisfy 2000-char limit
+            messages = []
+            while len(text) > 1900:
+                cut = text.rfind("\n", 0, 1900)
+                if cut == -1:
+                    cut = 1900
+                messages.append(text[:cut])
+                text = text[cut:]
+            messages.append(text)
+
+            await interaction.response.send_message(messages[0], ephemeral=True)
+            for chunk in messages[1:]:
+                await interaction.followup.send(chunk, ephemeral=True)
 
     view = RallyView(r.message_id)
     if r.temp_vc_invite_url:
@@ -592,7 +494,7 @@ class RollingMenuView(discord.ui.View):
     async def s5(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
             "The bot will join your current VC and start. Continue?",
-            view=ConfirmJoinVCView("5s Intervals", AUDIO_5S_ROLL),
+            view=ExplainOrStartView("5s Intervals", AUDIO_5S_ROLL),
             ephemeral=True
         )
 
@@ -600,7 +502,7 @@ class RollingMenuView(discord.ui.View):
     async def s10(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
             "The bot will join your current VC and start. Continue?",
-            view=ConfirmJoinVCView("10s Intervals", AUDIO_10S_ROLL),
+            view=ExplainOrStartView("10s Intervals", AUDIO_10S_ROLL),
             ephemeral=True
         )
 
@@ -608,7 +510,7 @@ class RollingMenuView(discord.ui.View):
     async def s15(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
             "The bot will join your current VC and start. Continue?",
-            view=ConfirmJoinVCView("15s Intervals", AUDIO_15S_ROLL),
+            view=ExplainOrStartView("15s Intervals", AUDIO_15S_ROLL),
             ephemeral=True
         )
 
@@ -616,7 +518,7 @@ class RollingMenuView(discord.ui.View):
     async def s30(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
             "The bot will join your current VC and start. Continue?",
-            view=ConfirmJoinVCView("30s Intervals", AUDIO_30S_ROLL),
+            view=ExplainOrStartView("30s Intervals", AUDIO_30S_ROLL),
             ephemeral=True
         )
 
@@ -659,30 +561,35 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
             return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
 
         invite_url = await create_or_refresh_vc_invite(vc)
-        thread = await create_thread_for_rally(channel, "🧵 Keep Rally Thread", author)
 
+        # Create "creating..." message then replace with real embed + view
         dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
         r = Rally(
-            message_id=dummy.id, guild_id=guild.id, channel_id=channel.id, creator_id=author.id, rally_kind="KEEP",
+            message_id=dummy.id,
+            guild_id=guild.id,
+            channel_id=channel.id,
+            creator_id=author.id,
+            rally_kind="KEEP",
             keep_power=self.keep_power.value.strip(),
             primary_troop=self.primary_troop.value.strip().title(),  # type: ignore
             keep_level=self.keep_level.value.strip().upper(),
             gear_worn=self.gear_worn.value.strip(),
             idle_and_scouted=self.idle_and_scouted.value.strip(),
-            temp_vc_id=vc.id, temp_vc_invite_url=invite_url, private_thread_id=thread.id
+            temp_vc_id=vc.id,
+            temp_vc_invite_url=invite_url,
         )
         r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
         RALLIES[dummy.id] = r
         VC_TO_POST[vc.id] = dummy.id
 
-       await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+        await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
 
-# NEW: post the role-ping CTA as a normal message
-text, mentions = rally_cta_text(guild)
-await channel.send(text, allowed_mentions=mentions)
+        # Post the role-ping CTA as a normal message (outside the embed)
+        text, mentions = rally_cta_text(guild)
+        await channel.send(text, allowed_mentions=mentions)
 
-await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
-asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
+        await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
+        asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
 @rally_group.command(name="sop", description="Create a Seat of Power Rally")
 async def rally_sop(interaction: discord.Interaction):
@@ -699,18 +606,27 @@ async def rally_sop(interaction: discord.Interaction):
         return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
 
     invite_url = await create_or_refresh_vc_invite(vc)
-    thread = await create_thread_for_rally(channel, "🧵 SOP Rally Thread", author)
 
     dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
     r = Rally(
-        message_id=dummy.id, guild_id=guild.id, channel_id=channel.id, creator_id=author.id, rally_kind="SOP",
-        temp_vc_id=vc.id, temp_vc_invite_url=invite_url, private_thread_id=thread.id
+        message_id=dummy.id,
+        guild_id=guild.id,
+        channel_id=channel.id,
+        creator_id=author.id,
+        rally_kind="SOP",
+        temp_vc_id=vc.id,
+        temp_vc_invite_url=invite_url,
     )
     r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
     RALLIES[dummy.id] = r
     VC_TO_POST[vc.id] = dummy.id
 
     await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+
+    # Optional: also ping hitters for SOP
+    text, mentions = rally_cta_text(guild)
+    await channel.send(text, allowed_mentions=mentions)
+
     await interaction.response.send_message(f"SOP Rally posted in {channel.mention}.", ephemeral=True)
     asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
@@ -737,19 +653,13 @@ async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, re
         pass
     if mid and mid in RALLIES:
         r = RALLIES[mid]
-        if r.private_thread_id:
-            th = guild.get_thread(r.private_thread_id)
-            if th and not th.archived:
-                try:
-                    await th.edit(archived=True, reason=reason)
-                except Exception:
-                    pass
         r.temp_vc_id = None
         r.temp_vc_invite_url = None
         await update_post(guild, r)
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Immediate cleanup: if any rally VC becomes empty, delete it
     for ch in (before.channel, after.channel):
         if not isinstance(ch, discord.VoiceChannel):
             continue
