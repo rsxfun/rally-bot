@@ -109,12 +109,21 @@ VC_TO_POST: Dict[int, int] = {}
 
 # ============================== UTILITIES ==============================
 
+from typing import Tuple  # make sure this import exists
+
 def role_mention(guild: discord.Guild, role_name: str) -> str:
     r = discord.utils.find(lambda rr: rr.name.lower() == role_name.lower(), guild.roles)
     return r.mention if r else f"@{role_name}"
 
-def thread_link(guild_id: int, thread_id: int) -> str:
-    return f"https://discord.com/channels/{guild_id}/{thread_id}"
+def rally_cta_text(guild: discord.Guild) -> Tuple[str, discord.AllowedMentions]:
+    text = (
+        f"{role_mention(guild, HITTERS_ROLE_NAME)} there is a rally being formed!\n"
+        "Sign up by clicking **Join Rally**, complete the form and you're in!\n"
+        "Don't forget to form your rally and, once you do, use "
+        "`/type_of_rally rolling` or `/type_of_rally bomb` to set up the countdown you want!"
+    )
+    mentions = discord.AllowedMentions(everyone=False, users=False, roles=True)  # allow role pings only
+    return text, mentions
 
 def ensure_int(value: str, default: int = 0) -> int:
     try:
@@ -668,11 +677,14 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
 
        await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
 
-await channel.send(
-    f"{role_mention(guild, HITTERS_ROLE_NAME)} — Don’t forget to use `/type_of_rally` for Bomb/Rolling!",
-    allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True)
-)
+# NEW: post the role-ping CTA as a normal message
+text, mentions = rally_cta_text(guild)
+await channel.send(text, allowed_mentions=mentions)
 
+# (then your ephemeral confirmation, etc.)
+await interaction.response.send_message(
+    f"Keep Rally posted in {channel.mention}.", ephemeral=True
+)
 await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
 asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
