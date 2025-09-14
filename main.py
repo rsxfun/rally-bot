@@ -240,8 +240,6 @@ async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
 
 def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
     title = "🏰 Keep Rally" if r.rally_kind == "KEEP" else "🛡️ Seat of Power Rally"
-    # was: desc = f"{role_mention(...)} — Don't forget ..."
-    # and: discord.Embed(title=title, description=desc, color=...)
     e = discord.Embed(title=title, color=discord.Color.blurple())
 
     if r.rally_kind == "KEEP":
