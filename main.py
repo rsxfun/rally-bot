@@ -681,10 +681,6 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
 text, mentions = rally_cta_text(guild)
 await channel.send(text, allowed_mentions=mentions)
 
-# (then your ephemeral confirmation, etc.)
-await interaction.response.send_message(
-    f"Keep Rally posted in {channel.mention}.", ephemeral=True
-)
 await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
 asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
@@ -715,10 +711,6 @@ async def rally_sop(interaction: discord.Interaction):
     VC_TO_POST[vc.id] = dummy.id
 
     await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
-    await channel.send(
-    f"{role_mention(guild, HITTERS_ROLE_NAME)} — Don’t forget to use `/type_of_rally` for Bomb/Rolling!",
-    allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True)
-)
     await interaction.response.send_message(f"SOP Rally posted in {channel.mention}.", ephemeral=True)
     asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
