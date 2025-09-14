@@ -240,6 +240,7 @@ async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
 
 def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
     title = "🏰 Keep Rally" if r.rally_kind == "KEEP" else "🛡️ Seat of Power Rally"
+    # previously this used: desc = f"{role_mention(...)}..." and description=desc
     e = discord.Embed(title=title, color=discord.Color.blurple())
 
     creator = guild.get_member(r.creator_id)
@@ -256,13 +257,12 @@ def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
         ch = guild.get_channel(r.temp_vc_id)
         if isinstance(ch, discord.VoiceChannel):
             e.add_field(name="Voice Channel", value=ch.mention, inline=False)
-
     if r.private_thread_id:
         th = guild.get_thread(r.private_thread_id)
         if th:
             e.add_field(name="Party Thread", value=th.mention, inline=False)
 
-    e.add_field(name="Roster", value=r.roster_mentions() or "—", inline=False)
+    e.add_field(name="Roster", value=r.roster_mentions(), inline=False)
     return e
 
 async def dm_join_info(member: discord.Member, r: Rally, sop: bool):
