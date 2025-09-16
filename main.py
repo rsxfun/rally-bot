@@ -235,7 +235,7 @@ async def update_post(guild: discord.Guild, r: Rally):
 def _try_load_opus() -> bool:
     if discord.opus.is_loaded():
         return True
-    for name in ("opus", "libopus.so.0", "libopus"):
+    for name in ("libopus.so.0", "opus", "libopus"):
         try:
             discord.opus.load_opus(name)
             return True
@@ -244,12 +244,14 @@ def _try_load_opus() -> bool:
     return False
 
 async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceClient]:
+    """Join (or move to) the member's VC and wait up to ~10s for the voice
+    websocket + UDP handshake to complete. Logs detailed reasons on failure."""
     if not ENABLE_VOICE:
         return None
     if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
         return None
     if not _try_load_opus():
-        log.error("Opus failed to load (install libopus).")
+        log.error("Opus failed to load (libopus). Install system libopus or PyNaCl.")
         return None
 
     vc_target = member.voice.channel
@@ -259,17 +261,21 @@ async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceC
             if voice.channel.id != vc_target.id:
                 await voice.move_to(vc_target)
         else:
-            voice = await vc_target.connect(timeout=30.0, reconnect=True)
+            # longer timeout + reconnect; self_deaf avoids echo issues
+            voice = await vc_target.connect(timeout=30.0, reconnect=True, self_deaf=True)
 
-        # Wait until connected (up to ~10s)
+        # Wait until the library reports the voice connection is really up.
+        # Give it ~10s; some hosts/regions are slow to complete UDP discovery.
         for _ in range(40):
+            await asyncio.sleep(0.25)
             if voice.is_connected():
                 return voice
-            await asyncio.sleep(0.25)
+
+        log.error("Voice timed out: gateway connected but UDP never established.")
+        return None
     except Exception as e:
         log.exception("Voice connect/move failed: %s", e)
-
-    return None
+        return None
 
 async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[bool, str]:
     if not ENABLE_VOICE:
