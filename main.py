@@ -109,10 +109,10 @@ def role_mention(guild: discord.Guild, role_name: str) -> str:
 
 def rally_cta_text(guild: discord.Guild) -> Tuple[str, discord.AllowedMentions]:
     text = (
-        f"{role_mention(guild, HITTERS_ROLE_NAME)} how are y'all doing? A rally is being formed!\n"
+        f"{role_mention(guild, HITTERS_ROLE_NAME)} A rally is being formed!\n"
         "Sign up by clicking **Join Rally**, complete the form and you're in!\n"
-        "Don't forget to form your rally and, once you do, use "
-        "`/type_of_rally rolling` or `/type_of_rally bomb` to set up the countdown you want!"
+        "Once everyone signs up you can **Export Roster** to then form your rally, once you do, use "
+        "`/type_of_rally rolling` or `/type_of_rally bomb` to set up the vc countdown you want!"
     )
     # allow role pings only (no user mass pings)
     mentions = discord.AllowedMentions(everyone=False, users=False, roles=True)
