@@ -235,7 +235,7 @@ async def update_post(guild: discord.Guild, r: Rally):
 def _try_load_opus() -> bool:
     if discord.opus.is_loaded():
         return True
-    for name in ("libopus.so.0", "opus", "libopus"):
+    for name in ("opus", "libopus.so.0", "libopus"):
         try:
             discord.opus.load_opus(name)
             return True
@@ -243,65 +243,70 @@ def _try_load_opus() -> bool:
             continue
     return False
 
-async def _ensure_voice_ready(member: discord.Member) -> Optional[discord.VoiceClient]:
-    """Join (or move to) the member's VC and wait up to ~10s for the voice
-    websocket + UDP handshake to complete. Logs detailed reasons on failure."""
+async def _ensure_voice_ready(member: discord.Member) -> tuple[Optional[discord.VoiceClient], Optional[str]]:
+    """
+    Join (or move to) the member's current voice channel and return (voice_client, error_message).
+    error_message is None on success.
+    """
     if not ENABLE_VOICE:
-        return None
+        return None, "Voice playback is disabled on this host (ENABLE_VOICE=false)."
     if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
-        return None
+        return None, "You must be connected to a voice channel first."
     if not _try_load_opus():
-        log.error("Opus failed to load (libopus). Install system libopus or PyNaCl.")
-        return None
+        return None, "Opus failed to load. Install system libopus or PyNaCl."
 
-    vc_target = member.voice.channel
+    vc_target: discord.VoiceChannel = member.voice.channel  # type: ignore
+
+    # Permission check up front (most common cause)
+    perms = vc_target.permissions_for(vc_target.guild.me)  # type: ignore
+    missing = []
+    if not perms.connect:
+        missing.append("Connect")
+    if not perms.speak:
+        missing.append("Speak")
+    if missing:
+        return None, f"I need {' and '.join(missing)} permission in **{vc_target.name}**."
+
     try:
         voice = member.guild.voice_client
         if voice and voice.is_connected():
             if voice.channel.id != vc_target.id:
                 await voice.move_to(vc_target)
         else:
-            # longer timeout + reconnect; self_deaf avoids echo issues
-            voice = await vc_target.connect(timeout=30.0, reconnect=True, self_deaf=True)
+            voice = await vc_target.connect(timeout=30.0, reconnect=True)
 
-        # Wait until the library reports the voice connection is really up.
-        # Give it ~10s; some hosts/regions are slow to complete UDP discovery.
+        # Wait up to ~10s for the connection to fully become active
         for _ in range(40):
             await asyncio.sleep(0.25)
-            if voice.is_connected():
-                return voice
+            if voice and voice.is_connected():
+                return voice, None
 
-        log.error("Voice timed out: gateway connected but UDP never established.")
-        return None
+        return None, "Timed out connecting to voice (handshake incomplete)."
+
     except Exception as e:
         log.exception("Voice connect/move failed: %s", e)
-        return None
+        return None, f"Could not connect to voice: {e.__class__.__name__}. See bot logs."
 
-async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[bool, str]:
-    if not ENABLE_VOICE:
-        return False, "Voice playback is disabled on this host (ENABLE_VOICE=false)."
-
-    voice = await _ensure_voice_ready(member)
-    if not voice or not voice.is_connected():
-        return False, (
-            "Could not connect to voice.\n"
-            "• Hosting providers often block UDP required by Discord voice.\n"
-            "• Ensure **UDP is allowed**, **ffmpeg** is installed, and **Opus** is available."
-        )
+async def play_audio_in_member_vc(member: discord.Member, url: str) -> tuple[bool, str]:
+    voice, err = await _ensure_voice_ready(member)
+    if not voice:
+        return False, err or "Could not connect to voice."
 
     try:
         if voice.is_playing():
             voice.stop()
-       audio = discord.FFmpegPCMAudio(
-    url,
-    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    options='-vn'
-)
+
+        # More resilient ffmpeg input (reconnect flags, no video)
+        audio = discord.FFmpegOpusAudio(
+            url,
+            before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            options='-vn -loglevel error'
+        )
         voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
         return True, "Playback started."
     except Exception as e:
         log.exception("Play error: %s", e)
-        return False, "Playback failed (check ffmpeg/Opus/permissions)."
+        return False, "Playback failed (check permissions/ffmpeg/Opus)."
 
 # ============================== VIEWS & MODALS ==============================
 
