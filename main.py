@@ -297,16 +297,12 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> tuple[boo
             voice.stop()
 
         # More resilient ffmpeg input (reconnect flags, no video)
-        audio = discord.FFmpegOpusAudio(
-            url,
-            before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-            options='-vn -loglevel error'
-        )
-        voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
-        return True, "Playback started."
-    except Exception as e:
-        log.exception("Play error: %s", e)
-        return False, "Playback failed (check permissions/ffmpeg/Opus)."
+audio = discord.FFmpegPCMAudio(
+    url,
+    before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    options='-vn -loglevel error'
+)
+voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
 
 # ============================== VIEWS & MODALS ==============================
 
