@@ -292,7 +292,11 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[boo
     try:
         if voice.is_playing():
             voice.stop()
-        audio = discord.FFmpegPCMAudio(url)
+       audio = discord.FFmpegPCMAudio(
+    url,
+    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    options='-vn'
+)
         voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
         return True, "Playback started."
     except Exception as e:
