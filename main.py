@@ -156,14 +156,25 @@ async def ensure_temp_vc(
     cat = await pick_or_create_category(guild, context_channel, owner)
 
     overwrites = {
+        # everyone can see/connect
         guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True),
-        owner: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+
+        # ⬇️ Give the BOT manage_channels so it can delete the temp VC later
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, connect=True, move_members=True, manage_channels=True
+        ),
+
+        # host convenience
+        owner: discord.PermissionOverwrite(
+            view_channel=True, connect=True, manage_channels=True
+        ),
     }
+
     vc = await guild.create_voice_channel(
         name=f"{owner.display_name}'s Rally",
         category=cat,
-        user_limit=size_hint if 1 <= size_hint <= 99 else 0,
+        # ⬇️ Unlimited joiners (removes the “/10” limit)
+        user_limit=0,
         overwrites=overwrites,
         reason=f"Rally temp VC ({name_hint})",
     )
