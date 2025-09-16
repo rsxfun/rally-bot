@@ -554,7 +554,7 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
             return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
 
         try:
-            vc = await ensure_temp_vc(guild, author, channel, "Keep Rally", 10)
+            vc = await ensure_temp_vc(guild, author, channel, "Keep Rally", 0)
         except Exception as e:
             return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
 
@@ -599,7 +599,7 @@ async def rally_sop(interaction: discord.Interaction):
         return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
 
     try:
-        vc = await ensure_temp_vc(guild, author, channel, "SOP Rally", 10)
+        vc = await ensure_temp_vc(guild, author, channel, "SOP Rally", 0)
     except Exception as e:
         return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
 
