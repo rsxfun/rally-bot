@@ -51,6 +51,9 @@ def _parse_guild_ids() -> List[int]:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("rally-bot")
+# Extra voice logs to diagnose fast disconnects
+logging.getLogger("discord.voice_client").setLevel(logging.DEBUG)
+logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -119,7 +122,6 @@ def rally_cta_text(guild: discord.Guild) -> Tuple[str, discord.AllowedMentions]:
         "Once everyone signs up you can **Export Roster** to form your rally, and then use "
         "`/type_of_rally rolling` or `/type_of_rally bomb` to start the VC countdown."
     )
-    # allow role pings only (no user mass pings)
     mentions = discord.AllowedMentions(everyone=False, users=False, roles=True)
     return text, mentions
 
@@ -134,21 +136,14 @@ async def pick_or_create_category(
     context_channel: Optional[discord.abc.GuildChannel],
     owner: Optional[discord.Member],
 ) -> discord.CategoryChannel:
-    # 1) explicit env category
     if TEMP_VC_CATEGORY_ID:
         ch = guild.get_channel(TEMP_VC_CATEGORY_ID)
         if isinstance(ch, discord.CategoryChannel):
             return ch
-
-    # 2) the channel where command was run
     if isinstance(context_channel, (discord.TextChannel, discord.VoiceChannel)) and context_channel.category:
         return context_channel.category
-
-    # 3) owner's current VC category
     if owner and owner.voice and isinstance(owner.voice.channel, discord.VoiceChannel) and owner.voice.channel.category:
         return owner.voice.channel.category
-
-    # 4) last resort: create a category
     return await guild.create_category("Rallies", reason="Rally temp VC category")
 
 async def ensure_temp_vc(
@@ -598,7 +593,6 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
 
         await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
 
-        # Post the role-ping CTA as a normal message (outside the embed)
         text, mentions = rally_cta_text(guild)
         await channel.send(text, allowed_mentions=mentions)
 
@@ -680,6 +674,25 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             continue
         if len(ch.members) == 0:
             await delete_rally_for_vc(ch.guild, ch, reason="Last user left VC.")
+
+# ============================== UTIL / DEBUG COMMANDS ==============================
+
+@tree.command(name="vc_hold", description="Connect to my VC and stay connected for N seconds (debug)")
+@app_commands.describe(seconds="How long to stay connected")
+async def vc_hold(interaction: discord.Interaction, seconds: int = 60):
+    member: discord.Member = interaction.user  # type: ignore
+    await interaction.response.defer(ephemeral=True)
+
+    voice, err = await _ensure_voice_ready(member)
+    if not voice:
+        return await interaction.followup.send(f"FAIL: {err}", ephemeral=True)
+
+    await interaction.followup.send(f"Connected. Holding for {seconds}s…", ephemeral=True)
+    try:
+        await asyncio.sleep(seconds)
+    finally:
+        # Intentionally do nothing—leave connected so we can observe behavior
+        pass
 
 # ============================== LIFECYCLE ==============================
 
