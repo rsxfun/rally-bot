@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Literal, Tuple
 
 import discord
+discord.VoiceClient.use_ipv6 = False
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -276,10 +277,10 @@ async def _ensure_voice_ready(member: discord.Member) -> tuple[Optional[discord.
             voice = await vc_target.connect(timeout=30.0, reconnect=True)
 
         # Wait up to ~10s for the connection to fully become active
-        for _ in range(40):
-            await asyncio.sleep(0.25)
-            if voice and voice.is_connected():
-                return voice, None
+        for _ in range(60):      # 60 * 0.25s ~= 15s
+    await asyncio.sleep(0.25)
+    if voice.is_connected():
+        return voice
 
         return None, "Timed out connecting to voice (handshake incomplete)."
 
