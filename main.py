@@ -1,3 +1,5 @@
+# main.py — Rally Bot (VC-safe join/play, no threads, roster text export, auto VC cleanup)
+
 import os
 import io
 import asyncio
@@ -6,10 +8,12 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Literal, Tuple
 
 import discord
-discord.VoiceClient.use_ipv6 = False
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
+# Prefer IPv4 for Discord voice on some VPS hosts
+discord.VoiceClient.use_ipv6 = False
 
 # ============================== ENV & CONFIG ==============================
 
@@ -19,7 +23,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_BOT_TOKEN (or DISCORD_TOKEN) in your environment.")
 
-GUILD_IDS = os.getenv("GUILD_IDS", "")  # e.g. "123...,987..."
+GUILD_IDS = os.getenv("GUILD_IDS", "")          # e.g. "123...,987..."
 TEMP_VC_CATEGORY_ID = int(os.getenv("TEMP_VC_CATEGORY_ID", "0"))
 HITTERS_ROLE_NAME = os.getenv("HITTERS_ROLE_NAME", "hitters")
 DELETE_VC_IF_EMPTY_AFTER_SECS = int(os.getenv("DELETE_VC_IF_EMPTY_AFTER_SECS", "300"))
@@ -110,10 +114,10 @@ def role_mention(guild: discord.Guild, role_name: str) -> str:
 
 def rally_cta_text(guild: discord.Guild) -> Tuple[str, discord.AllowedMentions]:
     text = (
-        f"{role_mention(guild, HITTERS_ROLE_NAME)} A rally is being formed!\n"
+        f"{role_mention(guild, HITTERS_ROLE_NAME)} how’s everyone doing? A rally is being formed!\n"
         "Sign up by clicking **Join Rally**, complete the form and you're in!\n"
-        "Once everyone signs up you can **Export Roster** to then form your rally, once you do, use "
-        "`/type_of_rally rolling` or `/type_of_rally bomb` to set up the vc countdown you want!"
+        "Once everyone signs up you can **Export Roster** to form your rally, and then use "
+        "`/type_of_rally rolling` or `/type_of_rally bomb` to start the VC countdown."
     )
     # allow role pings only (no user mass pings)
     mentions = discord.AllowedMentions(everyone=False, users=False, roles=True)
@@ -157,25 +161,15 @@ async def ensure_temp_vc(
     cat = await pick_or_create_category(guild, context_channel, owner)
 
     overwrites = {
-        # everyone can see/connect
         guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True),
-
-        # ⬇️ Give the BOT manage_channels so it can delete the temp VC later
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True, connect=True, move_members=True, manage_channels=True
-        ),
-
-        # host convenience
-        owner: discord.PermissionOverwrite(
-            view_channel=True, connect=True, manage_channels=True
-        ),
+        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True, manage_channels=True),
+        owner: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
     }
 
     vc = await guild.create_voice_channel(
         name=f"{owner.display_name}'s Rally",
         category=cat,
-        # ⬇️ Unlimited joiners (removes the “/10” limit)
-        user_limit=0,
+        user_limit=0,  # unlimited joiners
         overwrites=overwrites,
         reason=f"Rally temp VC ({name_hint})",
     )
@@ -244,7 +238,7 @@ def _try_load_opus() -> bool:
             continue
     return False
 
-async def _ensure_voice_ready(member: discord.Member) -> tuple[Optional[discord.VoiceClient], Optional[str]]:
+async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.VoiceClient], Optional[str]]:
     """
     Join (or move to) the member's current voice channel and return (voice_client, error_message).
     error_message is None on success.
@@ -258,7 +252,7 @@ async def _ensure_voice_ready(member: discord.Member) -> tuple[Optional[discord.
 
     vc_target: discord.VoiceChannel = member.voice.channel  # type: ignore
 
-    # Permission check up front (most common cause)
+    # Permission check up front
     perms = vc_target.permissions_for(vc_target.guild.me)  # type: ignore
     missing = []
     if not perms.connect:
@@ -279,15 +273,15 @@ async def _ensure_voice_ready(member: discord.Member) -> tuple[Optional[discord.
         # Wait until connected (up to ~10s)
         for _ in range(40):
             if voice.is_connected():
-                return voice
+                return voice, None
             await asyncio.sleep(0.25)
 
+        return None, "Timed out connecting to voice."
     except Exception as e:
         log.exception("Voice connect/move failed: %s", e)
+        return None, "Voice connect failed (see logs)."
 
-    return None
-    
-async def play_audio_in_member_vc(member: discord.Member, url: str) -> tuple[bool, str]:
+async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[bool, str]:
     voice, err = await _ensure_voice_ready(member)
     if not voice:
         return False, err or "Could not connect to voice."
@@ -296,13 +290,17 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> tuple[boo
         if voice.is_playing():
             voice.stop()
 
-        # More resilient ffmpeg input (reconnect flags, no video)
-audio = discord.FFmpegPCMAudio(
-    url,
-    before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    options='-vn -loglevel error'
-)
-voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
+        # Reconnect-friendly ffmpeg input (and suppress video)
+        audio = discord.FFmpegPCMAudio(
+            url,
+            before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            options='-vn -loglevel error'
+        )
+        voice.play(audio, after=lambda e: log.info("Playback finished: %s", e))
+        return True, "Playback started."
+    except Exception as e:
+        log.exception("Play error: %s", e)
+        return False, "Playback failed (check ffmpeg/Opus/permissions)."
 
 # ============================== VIEWS & MODALS ==============================
 
@@ -363,11 +361,10 @@ def build_rally_view(r: Rally) -> discord.ui.View:
                 return await interaction.response.send_message("This rally no longer exists.", ephemeral=True)
 
             parts: List[Participant] = sorted(r.participants.values(), key=lambda p: p.capacity_value, reverse=True)
-
             if not parts:
                 return await interaction.response.send_message("Roster is empty.", ephemeral=True)
 
-            # Build a readable, line-based roster using display names
+            # Build readable lines using display names
             lines: List[str] = []
             for p in parts:
                 m = interaction.guild.get_member(p.user_id)  # type: ignore
@@ -379,18 +376,16 @@ def build_rally_view(r: Rally) -> discord.ui.View:
             text = f"{header}\n```text\n{body}\n```"
 
             # Chunk to satisfy 2000-char limit
-            messages = []
-            while len(text) > 1900:
-                cut = text.rfind("\n", 0, 1900)
-                if cut == -1:
-                    cut = 1900
-                messages.append(text[:cut])
-                text = text[cut:]
-            messages.append(text)
+            chunks: List[str] = []
+            while len(text) > 1800:
+                cut = text.rfind("\n", 0, 1800)
+                chunks.append(text[:cut if cut != -1 else 1800])
+                text = text[(cut if cut != -1 else 1800):]
+            chunks.append(text)
 
-            await interaction.response.send_message(messages[0], ephemeral=True)
-            for chunk in messages[1:]:
-                await interaction.followup.send(chunk, ephemeral=True)
+            await interaction.response.send_message(chunks[0], ephemeral=True)
+            for c in chunks[1:]:
+                await interaction.followup.send(c, ephemeral=True)
 
     view = RallyView(r.message_id)
     if r.temp_vc_invite_url:
@@ -582,7 +577,6 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
 
         invite_url = await create_or_refresh_vc_invite(vc)
 
-        # Create "creating..." message then replace with real embed + view
         dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
         r = Rally(
             message_id=dummy.id,
@@ -643,7 +637,6 @@ async def rally_sop(interaction: discord.Interaction):
 
     await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
 
-    # Optional: also ping hitters for SOP
     text, mentions = rally_cta_text(guild)
     await channel.send(text, allowed_mentions=mentions)
 
