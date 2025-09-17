@@ -276,18 +276,17 @@ async def _ensure_voice_ready(member: discord.Member) -> tuple[Optional[discord.
         else:
             voice = await vc_target.connect(timeout=30.0, reconnect=True)
 
-        # Wait up to ~10s for the connection to fully become active
-        for _ in range(60):      # 60 * 0.25s ~= 15s
-    await asyncio.sleep(0.25)
-    if voice.is_connected():
-        return voice
-
-        return None, "Timed out connecting to voice (handshake incomplete)."
+        # Wait until connected (up to ~10s)
+        for _ in range(40):
+            if voice.is_connected():
+                return voice
+            await asyncio.sleep(0.25)
 
     except Exception as e:
         log.exception("Voice connect/move failed: %s", e)
-        return None, f"Could not connect to voice: {e.__class__.__name__}. See bot logs."
 
+    return None
+    
 async def play_audio_in_member_vc(member: discord.Member, url: str) -> tuple[bool, str]:
     voice, err = await _ensure_voice_ready(member)
     if not voice:
