@@ -1,7 +1,6 @@
-# main.py — Rally Bot (VC-safe join/play, no threads, roster text export, auto VC cleanup)
+# main.py — Rally Bot (VC-safe join/play, roster export, auto VC cleanup)
 
 import os
-import io
 import asyncio
 import logging
 from dataclasses import dataclass, field
@@ -51,14 +50,11 @@ def _parse_guild_ids() -> List[int]:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("rally-bot")
-# Extra voice logs to diagnose fast disconnects
-logging.getLogger("discord.voice_client").setLevel(logging.DEBUG)
-logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True       # for display names on roster
-intents.voice_states = True  # for VC auto-delete
+intents.members = True       # display names for roster
+intents.voice_states = True  # VC auto-delete
 
 bot = commands.Bot(
     command_prefix="!",
@@ -117,10 +113,9 @@ def role_mention(guild: discord.Guild, role_name: str) -> str:
 
 def rally_cta_text(guild: discord.Guild) -> Tuple[str, discord.AllowedMentions]:
     text = (
-        f"{role_mention(guild, HITTERS_ROLE_NAME)} how’s everyone doing? A rally is being formed!\n"
-        "Sign up by clicking **Join Rally**, complete the form and you're in!\n"
-        "Once everyone signs up you can **Export Roster** to form your rally, and then use "
-        "`/type_of_rally rolling` or `/type_of_rally bomb` to start the VC countdown."
+        f"{role_mention(guild, HITTERS_ROLE_NAME)} A rally is being formed!\n"
+        "Click **Join Rally**, fill the form, and you're in.\n"
+        "Then use `/type_of_rally rolling` or `/type_of_rally bomb` to run the countdown in VC."
     )
     mentions = discord.AllowedMentions(everyone=False, users=False, roles=True)
     return text, mentions
@@ -241,9 +236,9 @@ async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.
     if not ENABLE_VOICE:
         return None, "Voice playback is disabled on this host (ENABLE_VOICE=false)."
     if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
-        return None, "You must be connected to a voice channel first."
+        return None, "Join a voice channel first."
     if not _try_load_opus():
-        return None, "Opus failed to load. Install system libopus or PyNaCl."
+        return None, "Opus failed to load. Install libopus (and PyNaCl)."
 
     vc_target: discord.VoiceChannel = member.voice.channel  # type: ignore
 
@@ -255,7 +250,7 @@ async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.
     if not perms.speak:
         missing.append("Speak")
     if missing:
-        return None, f"I need {' and '.join(missing)} permission in **{vc_target.name}**."
+        return None, f"I need {', '.join(missing)} permission in **{vc_target.name}**."
 
     try:
         voice = member.guild.voice_client
@@ -263,18 +258,20 @@ async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.
             if voice.channel.id != vc_target.id:
                 await voice.move_to(vc_target)
         else:
-            voice = await vc_target.connect(timeout=30.0, reconnect=True)
+            # reconnect=True permits the library to complete multi-step handshakes
+            voice = await vc_target.connect(timeout=45.0, reconnect=True)
 
-        # Wait until connected (up to ~10s)
-        for _ in range(40):
+        # Wait up to ~15s for .is_connected() to flip true
+        for _ in range(60):
             if voice.is_connected():
+                log.info("Voice connected to %s (guild=%s)", vc_target.name, vc_target.guild.name)
                 return voice, None
             await asyncio.sleep(0.25)
 
         return None, "Timed out connecting to voice."
     except Exception as e:
         log.exception("Voice connect/move failed: %s", e)
-        return None, "Voice connect failed (see logs)."
+        return None, f"Voice connect failed: {e!s}"
 
 async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[bool, str]:
     voice, err = await _ensure_voice_ready(member)
@@ -675,7 +672,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if len(ch.members) == 0:
             await delete_rally_for_vc(ch.guild, ch, reason="Last user left VC.")
 
-# ============================== UTIL / DEBUG COMMANDS ==============================
+# ============================== UTIL / DEBUG ==============================
 
 @tree.command(name="vc_hold", description="Connect to my VC and stay connected for N seconds (debug)")
 @app_commands.describe(seconds="How long to stay connected")
@@ -691,7 +688,7 @@ async def vc_hold(interaction: discord.Interaction, seconds: int = 60):
     try:
         await asyncio.sleep(seconds)
     finally:
-        # Intentionally do nothing—leave connected so we can observe behavior
+        # Intentionally remain connected so you can observe behavior
         pass
 
 # ============================== LIFECYCLE ==============================
