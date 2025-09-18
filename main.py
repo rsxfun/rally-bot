@@ -421,7 +421,7 @@ class ExplainOrStartView(discord.ui.View):
         self.label = label
         self.url = url
 
-    @discord.ui.button(label="Start on VC", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Start Countdown on VC", style=discord.ButtonStyle.danger)
     async def start(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
             "The bot will join your current VC and start the countdown. Continue?",
@@ -429,18 +429,10 @@ class ExplainOrStartView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Explain on VC", style=discord.ButtonStyle.success)
-    async def explain_vc(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_message(
-            "The bot will join your current VC and start the explanation. Continue?",
-            view=ConfirmJoinVCView(self.label, self.url),
-            ephemeral=True
-        )
-
     @discord.ui.button(label="Explain in Text", style=discord.ButtonStyle.primary)
     async def explain_text(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message(
-            f"**{self.label}**:\n- Join VC.\n- Follow timing as instructed.\n",
+            f"**{self.label}**:\n- Rolling Rallies tend to be rallies that are spaced out in intervals, the spacing is determined off how many people you can get to set.\n- Bomb rallies are where you sync up your march timers and set a rally that will hit at the same time, this is typically at a seat of power.\n- Once you get your rally structured have it join VC and it will begind your countdown.\n",
             ephemeral=True
         )
 
