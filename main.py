@@ -97,12 +97,16 @@ class Rally:
     creator_id: int
     rally_kind: Literal["KEEP", "SOP"]
 
+    # NEW: keep name + split idle/scout fields
+    keep_name: Optional[str] = None
     keep_power: Optional[str] = None
     primary_troop: Optional[TroopType] = None
     keep_level: Optional[str] = None
-    gear_worn: Optional[str] = None
-    idle_and_scouted: Optional[str] = None
+    gear_worn: Optional[str] = None  # holds "Current Gear Target Is Wearing"
+    idle_time: Optional[str] = None  # e.g., "10m, 30m, 1h"
+    did_scout: Optional[str] = None  # e.g., "Yes 10m ago / No"
 
+    # kept for VC handling
     temp_vc_id: Optional[int] = None
     temp_vc_invite_url: Optional[str] = None
 
@@ -202,7 +206,12 @@ async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
     return invite.url
 
 def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
-    title = "🏰 Keep Rally" if r.rally_kind == "KEEP" else "🛡️ Seat of Power Rally"
+    # Title: "(Keep Name) Rally" for Keep rallies
+    if r.rally_kind == "KEEP":
+        title = f"{r.keep_name} Rally" if r.keep_name else "Keep Rally"
+    else:
+        title = "🛡️ Seat of Power Rally"
+
     e = discord.Embed(title=title, color=discord.Color.blurple())
 
     creator = guild.get_member(r.creator_id)
@@ -212,8 +221,9 @@ def embed_for_rally(guild: discord.Guild, r: Rally) -> discord.Embed:
         e.add_field(name="Power Level of Keep", value=r.keep_power or "—", inline=True)
         e.add_field(name="Primary Troop Type", value=r.primary_troop or "—", inline=True)
         e.add_field(name="Keep Level", value=r.keep_level or "—", inline=True)
-        e.add_field(name="Gear Worn", value=r.gear_worn or "—", inline=True)
-        e.add_field(name="Idle / Scouted", value=r.idle_and_scouted or "—", inline=True)
+        e.add_field(name="Current Gear Target Is Wearing", value=r.gear_worn or "—", inline=True)
+        e.add_field(name="How Long Has Target Been Idle", value=r.idle_time or "—", inline=True)
+        e.add_field(name="Did You Scout", value=r.did_scout or "—", inline=True)
 
     if r.temp_vc_id:
         ch = guild.get_channel(r.temp_vc_id)
@@ -605,11 +615,48 @@ rally_group = app_commands.Group(name="rally", description="Create a Keep Rally 
 tree.add_command(rally_group)
 
 class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
-    keep_power = discord.ui.TextInput(label="Power Level of Keep", placeholder="e.g., 200m, 350m", required=True, max_length=16)
-    primary_troop = discord.ui.TextInput(label="Primary Troop Type", placeholder="Cavalry / Infantry / Range", required=True, max_length=16)
-    keep_level = discord.ui.TextInput(label="Keep Level", placeholder="e.g., K30, K34", required=True, max_length=8)
-    gear_worn = discord.ui.TextInput(label="What Gear is Worn", placeholder="Farming / Crafting / Attack / Defense", required=True, max_length=32)
-    idle_and_scouted = discord.ui.TextInput(label="Idle Time & Scouted?", placeholder="e.g., Idle 10m, Scouted 20m ago / No", required=True, max_length=64)
+    keep_name = discord.ui.TextInput(
+        label="Keep Name",
+        placeholder="Example: Name of the keep you want to rally",
+        required=True,
+        max_length=64
+    )
+    keep_power = discord.ui.TextInput(
+        label="Power Level of Keep",
+        placeholder="Example: 100m, 200m, 350m",
+        required=True,
+        max_length=16
+    )
+    primary_troop = discord.ui.TextInput(
+        label="Primary Troop Type",
+        placeholder="Example: Cavalry / Infantry / Range",
+        required=True,
+        max_length=16
+    )
+    keep_level = discord.ui.TextInput(
+        label="Keep Level",
+        placeholder="Example: K26, K30, K34",
+        required=True,
+        max_length=8
+    )
+    gear_worn = discord.ui.TextInput(
+        label="Current Gear Target Is Wearing",
+        placeholder="Example: Farming / Crafting / Attack / Defense",
+        required=True,
+        max_length=32
+    )
+    idle_time = discord.ui.TextInput(
+        label="How Long Has Target Been Idle",
+        placeholder="Example: 10m, 30m, 1h",
+        required=True,
+        max_length=16
+    )
+    did_scout = discord.ui.TextInput(
+        label="Did You Scout",
+        placeholder="Example: Yes 10m ago, No",
+        required=True,
+        max_length=32
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
@@ -633,14 +680,20 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
             channel_id=channel.id,
             creator_id=author.id,
             rally_kind="KEEP",
+
+            # NEW fields wired up from the form
+            keep_name=self.keep_name.value.strip(),
             keep_power=self.keep_power.value.strip(),
-            primary_troop=self.primary_troop.value.strip().title(),  # type: ignore
+            primary_troop=self.primary_troop.value.strip().title(),  # Cavalry/Infantry/Range
             keep_level=self.keep_level.value.strip().upper(),
             gear_worn=self.gear_worn.value.strip(),
-            idle_and_scouted=self.idle_and_scouted.value.strip(),
+            idle_time=self.idle_time.value.strip(),
+            did_scout=self.did_scout.value.strip(),
+
             temp_vc_id=vc.id,
             temp_vc_invite_url=invite_url,
         )
+        # seed host in roster (unchanged behavior)
         r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
         RALLIES[dummy.id] = r
         VC_TO_POST[vc.id] = dummy.id
