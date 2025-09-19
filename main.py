@@ -614,49 +614,59 @@ async def type_rolling(interaction: discord.Interaction):
 rally_group = app_commands.Group(name="rally", description="Create a Keep Rally or a Seat of Power Rally")
 tree.add_command(rally_group)
 
-class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
-    keep_name = discord.ui.TextInput(
-        label="Keep Name",
-        placeholder="Example: Name of the keep you want to rally",
-        required=True,
-        max_length=64
-    )
-    keep_power = discord.ui.TextInput(
-        label="Power Level of Keep",
-        placeholder="Example: 100m, 200m, 350m",
-        required=True,
-        max_length=16
-    )
-    primary_troop = discord.ui.TextInput(
-        label="Primary Troop Type",
-        placeholder="Example: Cavalry / Infantry / Range",
-        required=True,
-        max_length=16
-    )
-    keep_level = discord.ui.TextInput(
-        label="Keep Level",
-        placeholder="Example: K26, K30, K34",
-        required=True,
-        max_length=8
-    )
-    gear_worn = discord.ui.TextInput(
-        label="Current Gear Target Is Wearing",
-        placeholder="Example: Farming / Crafting / Attack / Defense",
-        required=True,
-        max_length=32
-    )
-    idle_time = discord.ui.TextInput(
-        label="How Long Has Target Been Idle",
-        placeholder="Example: 10m, 30m, 1h",
-        required=True,
-        max_length=16
-    )
-    did_scout = discord.ui.TextInput(
-        label="Did You Scout",
-        placeholder="Example: Yes 10m ago, No",
-        required=True,
-        max_length=32
-    )
+class KeepForm(discord.ui.Modal):
+    """Modal compatible with all discord.py 2.x — inputs created in __init__ and added explicitly."""
+    def __init__(self):
+        super().__init__(title="Keep Rally Details")
+        # Build fields
+        self.keep_name = discord.ui.TextInput(
+            label="Keep Name",
+            placeholder="Example: Name of the keep you want to rally",
+            required=True,
+            max_length=64
+        )
+        self.keep_power = discord.ui.TextInput(
+            label="Power Level of Keep",
+            placeholder="Example: 100m, 200m, 350m",
+            required=True,
+            max_length=16
+        )
+        self.primary_troop = discord.ui.TextInput(
+            label="Primary Troop Type",
+            placeholder="Example: Cavalry / Infantry / Range",
+            required=True,
+            max_length=16
+        )
+        self.keep_level = discord.ui.TextInput(
+            label="Keep Level",
+            placeholder="Example: K26, K30, K34",
+            required=True,
+            max_length=8
+        )
+        self.gear_worn = discord.ui.TextInput(
+            label="Current Gear Target Is Wearing",
+            placeholder="Example: Farming / Crafting / Attack / Defense",
+            required=True,
+            max_length=32
+        )
+        self.idle_time = discord.ui.TextInput(
+            label="How Long Has Target Been Idle",
+            placeholder="Example: 10m, 30m, 1h",
+            required=True,
+            max_length=16
+        )
+        self.did_scout = discord.ui.TextInput(
+            label="Did You Scout",
+            placeholder="Example: Yes 10m ago, No",
+            required=True,
+            max_length=32
+        )
+        # Add in the correct order (each becomes an ActionRow)
+        for item in (
+            self.keep_name, self.keep_power, self.primary_troop,
+            self.keep_level, self.gear_worn, self.idle_time, self.did_scout
+        ):
+            self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
@@ -664,12 +674,14 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
         author: discord.Member = interaction.user  # type: ignore
 
         if not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
+            await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
+            return
 
         try:
             vc = await ensure_temp_vc(guild, author, channel, "Keep Rally", 0)
         except Exception as e:
-            return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
+            await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
+            return
 
         invite_url = await create_or_refresh_vc_invite(vc)
 
@@ -680,20 +692,16 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
             channel_id=channel.id,
             creator_id=author.id,
             rally_kind="KEEP",
-
-            # NEW fields wired up from the form
             keep_name=self.keep_name.value.strip(),
             keep_power=self.keep_power.value.strip(),
-            primary_troop=self.primary_troop.value.strip().title(),  # Cavalry/Infantry/Range
+            primary_troop=self.primary_troop.value.strip().title(),
             keep_level=self.keep_level.value.strip().upper(),
             gear_worn=self.gear_worn.value.strip(),
             idle_time=self.idle_time.value.strip(),
             did_scout=self.did_scout.value.strip(),
-
             temp_vc_id=vc.id,
             temp_vc_invite_url=invite_url,
         )
-        # seed host in roster (unchanged behavior)
         r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
         RALLIES[dummy.id] = r
         VC_TO_POST[vc.id] = dummy.id
@@ -705,46 +713,22 @@ class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
         await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
         asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
-@rally_group.command(name="sop", description="Create a Seat of Power Rally")
-async def rally_sop(interaction: discord.Interaction):
-    guild = interaction.guild
-    channel = interaction.channel
-    author: discord.Member = interaction.user  # type: ignore
-
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
-
-    try:
-        vc = await ensure_temp_vc(guild, author, channel, "SOP Rally", 0)
-    except Exception as e:
-        return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
-
-    invite_url = await create_or_refresh_vc_invite(vc)
-
-    dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
-    r = Rally(
-        message_id=dummy.id,
-        guild_id=guild.id,
-        channel_id=channel.id,
-        creator_id=author.id,
-        rally_kind="SOP",
-        temp_vc_id=vc.id,
-        temp_vc_invite_url=invite_url,
-    )
-    r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
-    RALLIES[dummy.id] = r
-    VC_TO_POST[vc.id] = dummy.id
-
-    await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
-    text, mentions = rally_cta_text(guild)
-    await channel.send(text, allowed_mentions=mentions)
-
-    await interaction.response.send_message(f"SOP Rally posted in {channel.mention}.", ephemeral=True)
-    asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
 
 @rally_group.command(name="keep", description="Create a Keep Rally (form)")
 async def rally_keep(interaction: discord.Interaction):
-    await interaction.response.send_modal(KeepForm())
+    # Send the modal as the FIRST response; if anything goes wrong, fail gracefully.
+    try:
+        await interaction.response.send_modal(KeepForm())
+    except Exception as e:
+        # If sending the modal fails for any reason, at least acknowledge the interaction.
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"Couldn't open the form: {e!s}", ephemeral=True)
+        else:
+            try:
+                await interaction.followup.send(f"Couldn't open the form: {e!s}", ephemeral=True)
+            except Exception:
+                pass
+
 
 # ============================== VC CLEANUP ==============================
 async def schedule_delete_if_empty(guild_id: int, vc_id: int):
