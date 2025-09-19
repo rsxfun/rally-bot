@@ -2,7 +2,7 @@
 # - Stays in VC
 # - Disconnects 20s after playback finishes
 # - Disconnects after 5m of inactivity
-#   (override with DISCONNECT_AFTER_PLAY_SECS / VOICE_IDLE_TIMEOUT_SECS)
+# - Adds RTC region pin + better voice logging
 
 import os
 import time
@@ -38,6 +38,10 @@ ENABLE_VOICE = os.getenv("ENABLE_VOICE", "false").strip().lower() in ("1", "true
 DISCONNECT_AFTER_PLAY_SECS = int(os.getenv("DISCONNECT_AFTER_PLAY_SECS", "20"))
 VOICE_IDLE_TIMEOUT_SECS   = int(os.getenv("VOICE_IDLE_TIMEOUT_SECS", "300"))  # 5 minutes
 
+# Voice region controls
+RTC_REGION_FOR_TEMP_VC = os.getenv("RTC_REGION_FOR_TEMP_VC", "").strip()  # e.g. "us-east"
+FORCE_RTC_REGION       = os.getenv("FORCE_RTC_REGION", "").strip()        # if set, try to set on the VC we join
+
 # Audio URLs
 AUDIO_5M_BOMB = os.getenv("AUDIO_5M_BOMB", "https://storage.googleapis.com/rallybot/5minbombcomplete.mp3")
 AUDIO_10M_BOMB = os.getenv("AUDIO_10M_BOMB", "https://storage.googleapis.com/rallybot/10minbomb.mp3")
@@ -57,6 +61,9 @@ def _parse_guild_ids() -> List[int]:
 # ============================== LOGGING & BOT ==============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("rally-bot")
+# Voice debug (helps confirm UDP handshake and region)
+logging.getLogger("discord.voice_client").setLevel(logging.DEBUG)
+logging.getLogger("discord.gateway").setLevel(logging.INFO)
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -167,6 +174,7 @@ async def ensure_temp_vc(
         user_limit=0,
         overwrites=overwrites,
         reason=f"Rally temp VC ({name_hint})",
+        rtc_region=(RTC_REGION_FOR_TEMP_VC or None),  # <— pin region for temp VCs if set
     )
     return vc
 
@@ -232,7 +240,6 @@ def _try_load_opus() -> bool:
             continue
     return False
 
-# Per-guild voice activity tracking (for idle disconnects)
 class GuildVoiceState:
     __slots__ = ("last_activity", "idle_task", "post_play_task")
     def __init__(self):
@@ -245,24 +252,20 @@ VOICE_STATE: Dict[int, GuildVoiceState] = {}
 def _touch_activity(guild_id: int):
     state = VOICE_STATE.setdefault(guild_id, GuildVoiceState())
     state.last_activity = time.time()
-    # restart idle timer
     if state.idle_task and not state.idle_task.done():
         state.idle_task.cancel()
     state.idle_task = asyncio.create_task(_idle_disconnect_later(guild_id))
 
 async def _idle_disconnect_later(guild_id: int):
     try:
-        # Sleep until idle timeout from last activity
         while True:
             state = VOICE_STATE.setdefault(guild_id, GuildVoiceState())
-            now = time.time()
-            wait = (state.last_activity + VOICE_IDLE_TIMEOUT_SECS) - now
+            wait = (state.last_activity + VOICE_IDLE_TIMEOUT_SECS) - time.time()
             if wait <= 0:
                 break
             await asyncio.sleep(min(wait, 10))
     except asyncio.CancelledError:
         return
-    # Time to disconnect (only if not playing)
     guild = bot.get_guild(guild_id)
     if not guild:
         return
@@ -275,7 +278,6 @@ async def _idle_disconnect_later(guild_id: int):
             log.warning("Idle disconnect failed: %s", e)
 
 async def _disconnect_after_play(guild_id: int):
-    """Disconnect a short time after playback completes (if nothing else is playing)."""
     await asyncio.sleep(DISCONNECT_AFTER_PLAY_SECS)
     guild = bot.get_guild(guild_id)
     if not guild:
@@ -289,11 +291,25 @@ async def _disconnect_after_play(guild_id: int):
             log.warning("Post-play disconnect failed: %s", e)
 
 async def _on_playback_finished(guild_id: int):
-    _touch_activity(guild_id)  # mark activity at finish
+    _touch_activity(guild_id)
     state = VOICE_STATE.setdefault(guild_id, GuildVoiceState())
     if state.post_play_task and not state.post_play_task.done():
         state.post_play_task.cancel()
     state.post_play_task = asyncio.create_task(_disconnect_after_play(guild_id))
+
+async def _maybe_force_region(vc_target: discord.VoiceChannel):
+    """If FORCE_RTC_REGION is set and we can manage the channel, set rtc_region."""
+    if not FORCE_RTC_REGION:
+        return
+    try:
+        perms = vc_target.permissions_for(vc_target.guild.me)  # type: ignore
+        if perms.manage_channels:
+            # Only edit if different (or auto)
+            if (vc_target.rtc_region or "").lower() != FORCE_RTC_REGION.lower():
+                await vc_target.edit(rtc_region=FORCE_RTC_REGION)
+                log.info("Set rtc_region='%s' on channel %s", FORCE_RTC_REGION, vc_target.name)
+    except Exception as e:
+        log.warning("Could not set rtc_region on %s: %s", vc_target.name, e)
 
 async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.VoiceClient], Optional[str]]:
     if not ENABLE_VOICE:
@@ -305,7 +321,9 @@ async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.
 
     vc_target: discord.VoiceChannel = member.voice.channel  # type: ignore
 
-    # Check connect/speak permissions
+    # Try forcing region if requested
+    await _maybe_force_region(vc_target)
+
     perms = vc_target.permissions_for(vc_target.guild.me)  # type: ignore
     missing = []
     if not perms.connect:
@@ -321,12 +339,16 @@ async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.
             if voice.channel.id != vc_target.id:
                 await voice.move_to(vc_target)
         else:
-            voice = await vc_target.connect(timeout=45.0, reconnect=True)
+            # self_deaf helps stability, timeout a bit higher for slow UDP handshakes
+            voice = await vc_target.connect(timeout=60.0, reconnect=True, self_deaf=True)
 
         # Wait up to ~15s for connected state
         for _ in range(60):
             if voice.is_connected():
-                log.info("Voice connected to %s (guild=%s)", vc_target.name, vc_target.guild.name)
+                log.info(
+                    "Voice connected to '%s' (guild='%s', rtc_region=%s)",
+                    vc_target.name, vc_target.guild.name, vc_target.rtc_region or "auto",
+                )
                 _touch_activity(member.guild.id)
                 return voice, None
             await asyncio.sleep(0.25)
@@ -345,14 +367,12 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[boo
         if voice.is_playing():
             voice.stop()
 
-        # Reconnect-friendly ffmpeg input (no video)
         audio = discord.FFmpegPCMAudio(
             url,
             before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
             options='-vn -loglevel error'
         )
 
-        # The 'after' callback runs in a thread — bounce back to the loop
         def _after_play(err: Optional[BaseException]):
             if err:
                 log.warning("Playback finished with error: %s", err)
@@ -678,7 +698,6 @@ async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, re
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # Immediate cleanup: if any rally VC becomes empty, delete it
     for ch in (before.channel, after.channel):
         if not isinstance(ch, discord.VoiceChannel):
             continue
@@ -703,7 +722,6 @@ async def vc_hold(interaction: discord.Interaction, seconds: int = 60):
         _touch_activity(member.guild.id)
         await asyncio.sleep(seconds)
     finally:
-        # Stay connected so you can observe; idle/post-play timers will handle disconnects.
         pass
 
 # ============================== LIFECYCLE ==============================
@@ -722,8 +740,9 @@ async def on_ready():
         log.exception("Failed to sync commands: %s", e)
 
     log.info(
-        "Logged in as %s (%s) | ENABLE_VOICE=%s | post-play=%ss | idle-timeout=%ss",
-        bot.user, bot.user.id, ENABLE_VOICE, DISCONNECT_AFTER_PLAY_SECS, VOICE_IDLE_TIMEOUT_SECS
+        "Logged in as %s (%s) | ENABLE_VOICE=%s | post-play=%ss | idle-timeout=%ss | tempVC-rtc=%s | force-rtc=%s",
+        bot.user, bot.user.id, ENABLE_VOICE, DISCONNECT_AFTER_PLAY_SECS, VOICE_IDLE_TIMEOUT_SECS,
+        RTC_REGION_FOR_TEMP_VC or "auto", FORCE_RTC_REGION or "off"
     )
 
 # ============================== ENTRYPOINT ==============================
