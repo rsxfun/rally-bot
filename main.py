@@ -162,21 +162,40 @@ async def ensure_temp_vc(
 ) -> discord.VoiceChannel:
     cat = await pick_or_create_category(guild, context_channel, owner)
 
+    # Explicitly allow CONNECT + SPEAK for the bot in the temp VC
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True, manage_channels=True),
-        owner: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, connect=True, speak=True, move_members=True, manage_channels=True
+        ),
+        owner: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, manage_channels=True),
     }
 
+    # Prefer the owner's current VC region (if they are already in voice)
+    owner_region = None
+    if owner.voice and isinstance(owner.voice.channel, discord.VoiceChannel):
+        owner_region = owner.voice.channel.rtc_region
+
+    # Create the VC with a pinned region (owner's region -> env -> Auto)
     vc = await guild.create_voice_channel(
         name=f"{owner.display_name}'s Rally",
         category=cat,
         user_limit=0,
         overwrites=overwrites,
         reason=f"Rally temp VC ({name_hint})",
-        rtc_region=(RTC_REGION_FOR_TEMP_VC or None),  # <— pin region for temp VCs if set
+        rtc_region=(owner_region or RTC_REGION_FOR_TEMP_VC or None),
     )
+
+    # Optional hard override if you set FORCE_RTC_REGION in env
+    if FORCE_RTC_REGION:
+        try:
+            await vc.edit(rtc_region=FORCE_RTC_REGION)
+            log.info("Force-pinned rtc_region='%s' on temp VC %s", FORCE_RTC_REGION, vc.name)
+        except Exception as e:
+            log.warning("Could not set rtc_region on temp VC %s: %s", vc.name, e)
+
     return vc
+
 
 async def create_or_refresh_vc_invite(vc: discord.VoiceChannel) -> str:
     invite = await vc.create_invite(max_age=0, max_uses=0, unique=True, reason="Rally VC button")
