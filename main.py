@@ -189,7 +189,7 @@ async def ensure_temp_vc(
     # Optional hard override if you set FORCE_RTC_REGION in env
     if FORCE_RTC_REGION:
         try:
-            await vc.edit(rtc_region=FORCE_REGION)
+            await vc.edit(rtc_region=FORCE_RTC_REGION)
             log.info("Force-pinned rtc_region='%s' on temp VC %s", FORCE_RTC_REGION, vc.name)
         except Exception as e:
             log.warning("Could not set rtc_region on temp VC %s: %s", vc.name, e)
@@ -257,19 +257,20 @@ def _try_load_opus() -> bool:
             discord.opus.load_opus(name)
             log.info("Opus loaded successfully using '%s'.", name)
             return True
-        except Exception:
-            log.debug("Failed to load Opus using '%s'.", name)
+        except Exception as e:
+            log.debug("Failed to load Opus using '%s': %s", name, e)
             continue
     log.error("Failed to load Opus. Voice playback will not work. Ensure libopus is installed and accessible.")
     return False
 
 class GuildVoiceState:
-    __slots__ = ("last_activity", "idle_task", "post_play_task", "disconnect_grace_period_task")
+    __slots__ = ("last_activity", "idle_task", "post_play_task", "disconnect_grace_period_task", "connection_failure_cooldown_until")
     def __init__(self):
         self.last_activity: float = time.time()
         self.idle_task: Optional[asyncio.Task] = None
         self.post_play_task: Optional[asyncio.Task] = None
         self.disconnect_grace_period_task: Optional[asyncio.Task] = None # To prevent immediate re-connect attempts
+        self.connection_failure_cooldown_until: float = 0.0 # Time until connection attempts are allowed again
 
 VOICE_STATE: Dict[int, GuildVoiceState] = {}
 
@@ -293,6 +294,10 @@ def _clean_guild_voice_state(guild_id: int):
 def _touch_activity(guild_id: int):
     state = VOICE_STATE.setdefault(guild_id, GuildVoiceState())
     state.last_activity = time.time()
+    
+    # Reset connection cooldown if activity is touched and a new idle task will be created
+    state.connection_failure_cooldown_until = 0.0 
+
     if state.idle_task and not state.idle_task.done():
         state.idle_task.cancel()
     state.idle_task = asyncio.create_task(_idle_disconnect_later(guild_id))
@@ -416,10 +421,21 @@ async def _maybe_force_region(vc_target: discord.VoiceChannel):
                 await vc_target.edit(rtc_region=FORCE_RTC_REGION)
                 log.info("Set rtc_region='%s' on channel %s", FORCE_RTC_REGION, vc_target.name)
     except Exception as e:
-        log.warning("Could not set rtc_region on %s: %s", vc_target.name, e)
+        log.warning("Could not set rtc_region on temp VC %s: %s", vc_target.name, e)
 
 async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.VoiceClient], Optional[str]]:
+    guild_id = member.guild.id # Get guild_id early for logging and state management
+    
+    # Check connection cooldown first
+    if guild_id in VOICE_STATE:
+        state = VOICE_STATE[guild_id]
+        if time.time() < state.connection_failure_cooldown_until:
+            remaining_time = int(state.connection_failure_cooldown_until - time.time())
+            log.warning("Skipping connection attempt for guild %s due to cooldown. Try again in %d seconds.", guild_id, remaining_time)
+            return None, f"Voice connection attempt on cooldown. Please wait {remaining_time} seconds before trying again."
+
     if not ENABLE_VOICE:
+        log.warning("Voice playback is disabled (ENABLE_VOICE=false).")
         return None, "Voice playback is disabled on this host (ENABLE_VOICE=false)."
     if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
         return None, "Join a voice channel first."
@@ -440,6 +456,7 @@ async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.
     if not perms.speak:
         missing.append("Speak")
     if missing:
+        log.warning("Missing permissions for bot in VC %s for guild %s: %s", vc_target.name, guild_id, ", ".join(missing))
         return None, f"I need {', '.join(missing)} permission in **{vc_target.name}**."
 
     try:
@@ -450,42 +467,48 @@ async def _ensure_voice_ready(member: discord.Member) -> Tuple[Optional[discord.
                 await voice.move_to(vc_target)
             else:
                 log.info("Bot already in target VC %s in guild %s", vc_target.name, member.guild.name)
-            # Bot is connected/moved, ensure its state is active
-            _touch_activity(member.guild.id)
+            # Bot is connected/moved, ensure its state is active and cooldown reset
+            _touch_activity(guild_id)
             return voice, None
         else:
             # Ensure any lingering state from previous disconnects is cleared before a fresh connect
-            _clean_guild_voice_state(member.guild.id) 
-            log.info("Connecting bot to VC '%s' in guild '%s'", vc_target.name, member.guild.name)
+            _clean_guild_voice_state(guild_id) 
+            log.info("Attempting to connect bot to VC '%s' in guild '%s'", vc_target.name, member.guild.name)
             # self_deaf helps stability, timeout a bit higher for slow UDP handshakes
             voice = await vc_target.connect(timeout=60.0, reconnect=True, self_deaf=True)
 
         # Wait up to ~15s for connected state
-        for i in range(60):
+        for i in range(60): # 60 * 0.25s = 15s
             if voice.is_connected():
                 log.info(
-                    "Voice connected to '%s' (guild='%s', rtc_region=%s) after %s attempts",
+                    "Voice connected successfully to '%s' (guild='%s', rtc_region=%s) after %s attempts",
                     vc_target.name, vc_target.guild.name, vc_target.rtc_region or "auto", i+1
                 )
-                _touch_activity(member.guild.id)
+                _touch_activity(guild_id)
                 return voice, None
             await asyncio.sleep(0.25)
 
-        log.error("Timed out connecting to voice for guild %s.", member.guild.id)
-        _clean_guild_voice_state(member.guild.id) # Clean state on timeout
+        # If loop finishes, it means connection timed out
+        log.error("Timed out connecting to voice for guild %s after 15 seconds.", guild_id)
+        state = VOICE_STATE.setdefault(guild_id, GuildVoiceState())
+        state.connection_failure_cooldown_until = time.time() + 60 # Cooldown for 60 seconds
+        _clean_guild_voice_state(guild_id) # Clean state on timeout
         return None, "Timed out connecting to voice."
     except Exception as e:
-        log.exception("Voice connect/move failed for guild %s: %s", member.guild.id, e)
-        _clean_guild_voice_state(member.guild.id) # Clean state on connection error
+        log.exception("Voice connect/move failed for guild %s: %s", guild_id, e)
+        state = VOICE_STATE.setdefault(guild_id, GuildVoiceState())
+        state.connection_failure_cooldown_until = time.time() + 60 # Cooldown for 60 seconds
+        _clean_guild_voice_state(guild_id) # Clean state on connection error
         return None, f"Voice connect failed: {e!s}"
 
 async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[bool, str]:
     if not url:
+        log.error("Attempted to play audio with an empty URL for guild %s", member.guild.id)
         return False, "No audio URL provided for this command. Check your environment variables."
 
     voice, err = await _ensure_voice_ready(member)
     if not voice:
-        log.error("Failed to get voice client for playback in guild %s: %s", member.guild.id, err)
+        log.error("Failed to get voice client ready for playback in guild %s: %s", member.guild.id, err)
         return False, err or "Could not connect to voice."
 
     try:
@@ -497,7 +520,8 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[boo
         audio = discord.FFmpegPCMAudio(
             url,
             before_options='-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-            options='-vn -loglevel error'
+            # Set loglevel to error for production, debug/info for diagnostics
+            options='-vn -loglevel error' 
         )
 
         def _after_play(err: Optional[BaseException]):
@@ -512,7 +536,7 @@ async def play_audio_in_member_vc(member: discord.Member, url: str) -> Tuple[boo
         _touch_activity(member.guild.id) # Reset idle timer as playback has started
         return True, "Playback started."
     except Exception as e:
-        log.exception("Play error in guild %s: %s", member.guild.id, e)
+        log.exception("Play error for guild %s (URL: %s): %s", member.guild.id, url, e)
         # Attempt to provide more specific error messages for FFmpeg
         if "ffmpeg" in str(e).lower() or "no such file or directory" in str(e).lower():
              return False, "Playback failed: FFmpeg might not be installed or not in system's PATH. Ensure it's correctly set up."
@@ -627,8 +651,10 @@ class ConfirmJoinVCView(discord.ui.View):
                 ephemeral=True
             )
         
+        # Check if URL is valid before attempting to connect
         if not self.url_to_play:
-            return await interaction.response.send_message(f"No audio file configured for **{self.url_label}**. Please ensure the relevant environment variable is set.", ephemeral=True)
+            return await interaction.response.send_message(f"No audio file configured for **{self.url_label}**. Please ensure the relevant environment variable is set (e.g., AUDIO_30M_BOMB).", ephemeral=True)
+
 
         await interaction.response.defer(ephemeral=True)
         ok, msg = await play_audio_in_member_vc(member, self.url_to_play)
@@ -675,12 +701,12 @@ class BombMenuView(discord.ui.View):
 
     @discord.ui.button(label="30 Minute Bomb", style=discord.ButtonStyle.danger)
     async def b30(self, interaction: discord.Interaction, _: discord.ui.Button):
-        # Use an invalid URL placeholder if not set, ConfirmJoinVCView will catch this
+        # Pass the (potentially empty) URL; the view will handle the error message
         await interaction.response.send_message("Choose where to explain/run:", view=ExplainOrStartView("30m Bomb", AUDIO_30M_BOMB), ephemeral=True)
 
     @discord.ui.button(label="1 Hour Bomb", style=discord.ButtonStyle.danger)
     async def b60(self, interaction: discord.Interaction, _: discord.ui.Button):
-        # Use an invalid URL placeholder if not set, ConfirmJoinVCView will catch this
+        # Pass the (potentially empty) URL; the view will handle the error message
         await interaction.response.send_message("Choose where to explain/run:", view=ExplainOrStartView("1h Bomb", AUDIO_1H_BOMB), ephemeral=True)
 
     @discord.ui.button(label="Explain Bomb Rally", style=discord.ButtonStyle.success)
@@ -816,9 +842,6 @@ async def rally_keep(interaction: discord.Interaction):
 
 # ============================== VC CLEANUP ==============================
 async def schedule_delete_if_empty(guild_id: int, vc_id: int):
-    # Give a short grace period AFTER the main DELETE_VC_IF_EMPTY_AFTER_SECS
-    # This task will exist in parallel with the main voice_state idle task.
-    # We should ensure the idle task doesn't conflict here.
     await asyncio.sleep(DELETE_VC_IF_EMPTY_AFTER_SECS)
     guild = bot.get_guild(guild_id)
     if not guild:
@@ -835,10 +858,10 @@ async def schedule_delete_if_empty(guild_id: int, vc_id: int):
 async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, reason: str):
     mid = VC_TO_POST.pop(vc.id, None)
     try:
-        if vc.guild.voice_client and vc.guild.voice_client.channel.id == vc.id:
+        if guild.voice_client and guild.voice_client.channel and guild.voice_client.channel.id == vc.id:
             # If the bot is in this VC, disconnect it first
             log.info("Bot is in VC %s that is about to be deleted. Disconnecting bot.", vc.name)
-            await vc.guild.voice_client.disconnect()
+            await guild.voice_client.disconnect()
             _clean_guild_voice_state(guild.id) # Clean bot state after explicit disconnect
         
         log.info("Deleting temporary VC %s for reason: %s", vc.name, reason)
@@ -854,13 +877,16 @@ async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, re
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # Only process updates if it's not the bot itself changing state
-    if member.id == bot.user.id:
+    guild_id = member.guild.id if member.guild else None
+    
+    # Handle bot's own voice state changes
+    if member.id == bot.user.id and guild_id:
         # If the bot itself disconnected, ensure its state is cleaned
-        if before.channel is not None and after.channel is None and member.guild:
-            log.info("Bot disconnected from VC in guild %s. Cleaning its voice state.", member.guild.id)
-            _clean_guild_voice_state(member.guild.id)
-        return
+        if after.channel is None and before.channel is not None:
+            log.info("Bot disconnected from VC %s in guild %s. Cleaning its voice state.", before.channel.name, guild_id)
+            _clean_guild_voice_state(guild_id)
+        # If bot connected or moved, _touch_activity will be called by _ensure_voice_ready if it initiated the connect/move
+        return # Bot's own state change handled, no need to check other members' effects
 
     # Trigger activity check for the guild if a user's voice state changes (join/leave/mute/deaf)
     if member.guild:
@@ -911,21 +937,25 @@ async def vc_hold(interaction: discord.Interaction, seconds: int = 60):
 
     await interaction.followup.send(f"Connected. Holding for {seconds}s…", ephemeral=True)
     try:
-        # Extend activity well past the requested hold time to prevent premature idle disconnect
+        # To make it hold for `seconds`, we essentially make its last_activity appear in the distant future
+        # This will prevent the _idle_disconnect_later from triggering until after `seconds` + IDLE_TIMEOUT
         state = VOICE_STATE.setdefault(member.guild.id, GuildVoiceState())
-        state.last_activity = time.time() + seconds + VOICE_IDLE_TIMEOUT_SECS # Ensure it stays for full `seconds`
+        state.last_activity = time.time() + seconds + VOICE_IDLE_TIMEOUT_SECS * 2 # Sufficiently far in future
         if state.idle_task and not state.idle_task.done():
-            state.idle_task.cancel() # Cancel existing idle task
+            state.idle_task.cancel() # Cancel current idle task
+        # A new idle task will start when _touch_activity is called. But we manually set a distant last_activity
+        # so the new idle task will just wait.
         
         await asyncio.sleep(seconds)
     except asyncio.CancelledError:
         await interaction.followup.send("VC hold was cancelled.", ephemeral=True)
     finally:
-        _touch_activity(member.guild.id) # Re-enable normal idle timeout after hold
+        # Re-enable normal idle timeout after hold by touching activity
+        _touch_activity(member.guild.id) 
         log.info("VC hold for guild %s finished.", member.guild.id)
 
 
-@tree.command(name="stay", description="Keep the bot in voice chat until manually disconnected")
+@tree.command(name="stay", description="Keep the bot in voice chat until explicitly disconnected")
 async def stay_command(interaction: discord.Interaction):
     member: discord.Member = interaction.user  # type: ignore
     await interaction.response.defer(ephemeral=True)
@@ -937,21 +967,23 @@ async def stay_command(interaction: discord.Interaction):
     if not voice:
         return await interaction.followup.send(f"Failed to connect: {err}", ephemeral=True)
     
-    # Keep updating activity with a very long timeout to effectively stay indefinitely
+    # This command signifies the user wants the bot to stay.
+    # Set its last_activity far into the future so idle timeout doesn't happen easily.
     state = VOICE_STATE.setdefault(member.guild.id, GuildVoiceState())
-    state.last_activity = time.time() # Reset immediately
+    state.last_activity = time.time() + 3600 * 24 * 7 # Stay for about a week, or until manual disconnect
     if state.idle_task and not state.idle_task.done():
-        state.idle_task.cancel() # Cancel existing idle task
-    # Create a new idle task with a very long timeout, or set it to none if you want true indefinite stay
-    state.idle_task = asyncio.create_task(_idle_disconnect_later(member.guild.id))
-    # We still want the periodic check to ensure activity is refreshed
+        state.idle_task.cancel() # Cancel current idle task
+    # A new idle task will be created by _touch_activity, which will respect the distant last_activity
+    _touch_activity(member.guild.id) 
+    
     await interaction.followup.send("I'll stay in your voice channel indefinitely. Use `/leave` to disconnect me.", ephemeral=True)
 
 @tree.command(name="leave", description="Disconnect the bot from voice chat")
 async def leave_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    guild_id = interaction.guild.id # type: ignore
+
     if interaction.guild and interaction.guild.voice_client and interaction.guild.voice_client.is_connected():
-        guild_id = interaction.guild.id
         try:
             log.info("Bot manually disconnected from guild %s via /leave command.", guild_id)
             await interaction.guild.voice_client.disconnect()
@@ -962,6 +994,7 @@ async def leave_command(interaction: discord.Interaction):
             _clean_guild_voice_state(guild_id) # Ensure state cleanup even on error
             await interaction.followup.send(f"Failed to disconnect: {e}", ephemeral=True)
     else:
+        log.info("Attempted to leave voice in guild %s, but bot was not connected.", guild_id)
         await interaction.followup.send("I'm not connected to voice chat.", ephemeral=True)
 
 # ============================== LIFECYCLE ==============================
