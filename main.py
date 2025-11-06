@@ -593,4 +593,241 @@ class BombMenuView(discord.ui.View):
 
 @type_group.command(name="bomb", description="Bomb Rally options")
 async def type_bomb(interaction: discord.Interaction):
-    e = discord.Embed(title="💣 Bomb Rally", description="Pick an option
+    @type_group.command(name="bomb", description="Bomb Rally options")
+async def type_bomb(interaction: discord.Interaction):
+    e = discord.Embed(title="💣 Bomb Rally", description="Pick an option below.", color=discord.Color.blurple())
+    await interaction.response.send_message(embed=e, view=BombMenuView(), ephemeral=True)
+
+class RollingMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="5 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s5(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Choose:", view=ExplainOrStartView("5s Intervals", AUDIO_5S_ROLL), ephemeral=True)
+
+    @discord.ui.button(label="10 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s10(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Choose:", view=ExplainOrStartView("10s Intervals", AUDIO_10S_ROLL), ephemeral=True)
+
+    @discord.ui.button(label="15 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s15(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Choose:", view=ExplainOrStartView("15s Intervals", AUDIO_15S_ROLL), ephemeral=True)
+
+    @discord.ui.button(label="30 Second Intervals", style=discord.ButtonStyle.danger)
+    async def s30(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Choose:", view=ExplainOrStartView("30s Intervals", AUDIO_30S_ROLL), ephemeral=True)
+
+    @discord.ui.button(label="Explain Rolling Rally", style=discord.ButtonStyle.success)
+    async def rexplain(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("The bot will join your VC and explain. Continue?", view=ConfirmJoinVCView("Explain Rolling Rally", AUDIO_EXPLAIN_ROLL), ephemeral=True)
+
+@type_group.command(name="rolling", description="Rolling Rally options")
+async def type_rolling(interaction: discord.Interaction):
+    e = discord.Embed(title="🔁 Rolling Rally", description="Pick an option below.", color=discord.Color.blurple())
+    await interaction.response.send_message(embed=e, view=RollingMenuView(), ephemeral=True)
+
+# ============================== /rally GROUP ==============================
+rally_group = app_commands.Group(name="rally", description="Create a Keep Rally or a Seat of Power Rally")
+tree.add_command(rally_group)
+
+class KeepForm(discord.ui.Modal, title="Keep Rally Details"):
+    keep_power = discord.ui.TextInput(label="Power Level of Keep", placeholder="e.g., 200m, 350m", required=True, max_length=16)
+    primary_troop = discord.ui.TextInput(label="Primary Troop Type", placeholder="Cavalry / Infantry / Range", required=True, max_length=16)
+    keep_level = discord.ui.TextInput(label="Keep Level", placeholder="e.g., K30, K34", required=True, max_length=8)
+    gear_worn = discord.ui.TextInput(label="What Gear is Worn", placeholder="Farming / Crafting / Attack / Defense", required=True, max_length=32)
+    idle_and_scouted = discord.ui.TextInput(label="Idle Time & Scouted?", placeholder="e.g., Idle 10m, Scouted 20m ago / No", required=True, max_length=64)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        channel = interaction.channel
+        author: discord.Member = interaction.user
+
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
+
+        try:
+            vc = await ensure_temp_vc(guild, author, channel, "Keep Rally", 0)
+        except Exception as e:
+            return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
+
+        invite_url = await create_or_refresh_vc_invite(vc)
+
+        dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
+        r = Rally(
+            message_id=dummy.id,
+            guild_id=guild.id,
+            channel_id=channel.id,
+            creator_id=author.id,
+            rally_kind="KEEP",
+            keep_power=self.keep_power.value.strip(),
+            primary_troop=self.primary_troop.value.strip().title(),
+            keep_level=self.keep_level.value.strip().upper(),
+            gear_worn=self.gear_worn.value.strip(),
+            idle_and_scouted=self.idle_and_scouted.value.strip(),
+            temp_vc_id=vc.id,
+            temp_vc_invite_url=invite_url,
+        )
+        r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
+        RALLIES[dummy.id] = r
+        VC_TO_POST[vc.id] = dummy.id
+
+        await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+        text, mentions = rally_cta_text(guild)
+        await channel.send(text, allowed_mentions=mentions)
+
+        await interaction.response.send_message(f"Keep Rally posted in {channel.mention}.", ephemeral=True)
+        asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
+
+@rally_group.command(name="sop", description="Create a Seat of Power Rally")
+async def rally_sop(interaction: discord.Interaction):
+    guild = interaction.guild
+    channel = interaction.channel
+    author: discord.Member = interaction.user
+
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
+
+    try:
+        vc = await ensure_temp_vc(guild, author, channel, "SOP Rally", 0)
+    except Exception as e:
+        return await interaction.response.send_message(f"Couldn't create temp VC: {e}", ephemeral=True)
+
+    invite_url = await create_or_refresh_vc_invite(vc)
+
+    dummy = await channel.send(embed=discord.Embed(title="Creating rally...", color=discord.Color.blurple()))
+    r = Rally(
+        message_id=dummy.id,
+        guild_id=guild.id,
+        channel_id=channel.id,
+        creator_id=author.id,
+        rally_kind="SOP",
+        temp_vc_id=vc.id,
+        temp_vc_invite_url=invite_url,
+    )
+    r.participants[author.id] = Participant(author.id, "Cavalry", "T10", False, 0)
+    RALLIES[dummy.id] = r
+    VC_TO_POST[vc.id] = dummy.id
+
+    await dummy.edit(embed=embed_for_rally(guild, r), view=build_rally_view(r))
+    text, mentions = rally_cta_text(guild)
+    await channel.send(text, allowed_mentions=mentions)
+
+    await interaction.response.send_message(f"SOP Rally posted in {channel.mention}.", ephemeral=True)
+    asyncio.create_task(schedule_delete_if_empty(guild.id, vc.id))
+
+@rally_group.command(name="keep", description="Create a Keep Rally (form)")
+async def rally_keep(interaction: discord.Interaction):
+    await interaction.response.send_modal(KeepForm())
+
+# ============================== VC CLEANUP ==============================
+async def schedule_delete_if_empty(guild_id: int, vc_id: int):
+    await asyncio.sleep(DELETE_VC_IF_EMPTY_AFTER_SECS)
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    vc = guild.get_channel(vc_id)
+    if isinstance(vc, discord.VoiceChannel):
+        if len(vc.members) == 0:
+            log.info("Temporary VC %s is empty. Deleting.", vc.name)
+            await delete_rally_for_vc(guild, vc, reason="VC empty after grace period.")
+
+async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, reason: str):
+    mid = VC_TO_POST.pop(vc.id, None)
+    try:
+        if guild.voice_client and guild.voice_client.channel and guild.voice_client.channel.id == vc.id:
+            log.info("Bot is in VC %s that is being deleted. Disconnecting.", vc.name)
+            await guild.voice_client.disconnect()
+            if guild.id in VOICE_STATE:
+                del VOICE_STATE[guild.id]
+        
+        log.info("Deleting temporary VC %s for reason: %s", vc.name, reason)
+        await vc.delete(reason=reason)
+    except Exception as e:
+        log.warning("Failed to delete temporary VC %s: %s", vc.name, e)
+    
+    if mid and mid in RALLIES:
+        r = RALLIES[mid]
+        r.temp_vc_id = None
+        r.temp_vc_invite_url = None
+        await update_post(guild, r)
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.id == bot.user.id and member.guild:
+        if after.channel is None and before.channel is not None:
+            log.info("Bot disconnected from VC %s", before.channel.name)
+            if member.guild.id in VOICE_STATE:
+                del VOICE_STATE[member.guild.id]
+        return
+
+    if member.guild:
+        _reset_activity(member.guild.id)
+
+    for ch in (before.channel, after.channel):
+        if not isinstance(ch, discord.VoiceChannel):
+            continue
+        if ch.id not in VC_TO_POST:
+            continue
+        
+        if len(ch.members) == 0:
+            log.info("Last user left temporary VC %s. Scheduling deletion.", ch.name)
+            asyncio.create_task(schedule_delete_if_empty(ch.guild.id, ch.id))
+
+# ============================== UTIL / DEBUG ==============================
+@tree.command(name="stay", description="Keep the bot in voice chat")
+async def stay_command(interaction: discord.Interaction):
+    member: discord.Member = interaction.user
+    await interaction.response.defer(ephemeral=True)
+
+    if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
+        return await interaction.followup.send("You must be in a voice channel first.", ephemeral=True)
+    
+    voice, err = await _ensure_voice_ready(member)
+    if not voice:
+        return await interaction.followup.send(f"Failed to connect: {err}", ephemeral=True)
+    
+    state = VOICE_STATE.setdefault(member.guild.id, GuildVoiceState())
+    state.stay_mode = True
+    if state.disconnect_task and not state.disconnect_task.done():
+        state.disconnect_task.cancel()
+    
+    await interaction.followup.send("I'll stay in your voice channel. Use `/leave` to disconnect me.", ephemeral=True)
+
+@tree.command(name="leave", description="Disconnect the bot from voice chat")
+async def leave_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild and interaction.guild.voice_client and interaction.guild.voice_client.is_connected():
+        try:
+            log.info("Bot manually disconnected via /leave command")
+            await interaction.guild.voice_client.disconnect()
+            if interaction.guild.id in VOICE_STATE:
+                del VOICE_STATE[interaction.guild.id]
+            await interaction.followup.send("Disconnected from voice chat.", ephemeral=True)
+        except Exception as e:
+            log.error("Error during manual disconnect: %s", e)
+            await interaction.followup.send(f"Failed to disconnect: {e}", ephemeral=True)
+    else:
+        await interaction.followup.send("I'm not connected to voice chat.", ephemeral=True)
+
+# ============================== LIFECYCLE ==============================
+@bot.event
+async def on_ready():
+    try:
+        guild_ids = _parse_guild_ids()
+        if guild_ids:
+            for gid in guild_ids:
+                await tree.sync(guild=discord.Object(id=gid))
+            log.info("Slash commands synced to %d guild(s): %s", len(guild_ids), guild_ids)
+        else:
+            cmds = await tree.sync()
+            log.info("Globally synced %d commands.", len(cmds))
+    except Exception as e:
+        log.exception("Failed to sync commands: %s", e)
+
+    log.info("Logged in as %s (%s) | ENABLE_VOICE=%s", bot.user, bot.user.id, ENABLE_VOICE)
+
+# ============================== ENTRYPOINT ==============================
+if __name__ == "__main__":
+    bot.run(TOKEN)
