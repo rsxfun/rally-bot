@@ -34,9 +34,9 @@ DELETE_VC_IF_EMPTY_AFTER_SECS = int(os.getenv("DELETE_VC_IF_EMPTY_AFTER_SECS", "
 # Voice feature flag (requires ffmpeg + libopus on host)
 ENABLE_VOICE = os.getenv("ENABLE_VOICE", "false").strip().lower() in ("1", "true", "yes")
 
-# Auto-disconnect timers
-DISCONNECT_AFTER_PLAY_SECS = int(os.getenv("DISCONNECT_AFTER_PLAY_SECS", "20"))
-VOICE_IDLE_TIMEOUT_SECS   = int(os.getenv("VOICE_IDLE_TIMEOUT_SECS", "300"))  # 5 minutes
+# Auto-disconnect timers (INCREASED DEFAULT VALUES FOR BETTER PERSISTENCE)
+DISCONNECT_AFTER_PLAY_SECS = int(os.getenv("DISCONNECT_AFTER_PLAY_SECS", "120"))  # 2 minutes after play finishes
+VOICE_IDLE_TIMEOUT_SECS   = int(os.getenv("VOICE_IDLE_TIMEOUT_SECS", "1800"))    # 30 minutes of no user activity
 
 # Voice region controls
 RTC_REGION_FOR_TEMP_VC = os.getenv("RTC_REGION_FOR_TEMP_VC", "").strip()  # e.g. "us-east"
@@ -275,39 +275,78 @@ def _touch_activity(guild_id: int):
         state.idle_task.cancel()
     state.idle_task = asyncio.create_task(_idle_disconnect_later(guild_id))
 
+async def _check_user_activity(guild_id: int):
+    """Check if there are non-bot users in the VC and update activity accordingly"""
+    guild = bot.get_guild(guild_id)
+    if not guild or not guild.voice_client:
+        return
+    
+    vc = guild.voice_client.channel
+    if vc and isinstance(vc, discord.VoiceChannel):
+        non_bot_members = [m for m in vc.members if not m.bot]
+        if len(non_bot_members) > 0:  # Non-bot members present
+            _touch_activity(guild_id)
+            log.debug("Activity refreshed for guild %s due to %d users in VC", guild_id, len(non_bot_members))
+
 async def _idle_disconnect_later(guild_id: int):
     try:
         while True:
             state = VOICE_STATE.setdefault(guild_id, GuildVoiceState())
+            
+            guild = bot.get_guild(guild_id)
+            if guild and guild.voice_client and guild.voice_client.channel:
+                vc = guild.voice_client.channel
+                if isinstance(vc, discord.VoiceChannel):
+                    non_bot_members = [m for m in vc.members if not m.bot]
+                    if len(non_bot_members) > 0:
+                        # Users still present, extend activity and re-check later
+                        _touch_activity(guild_id)
+                        await asyncio.sleep(60) # Check again in 1 minute
+                        continue # Continue the loop to re-evaluate after sleep
+            
             wait = (state.last_activity + VOICE_IDLE_TIMEOUT_SECS) - time.time()
             if wait <= 0:
-                break
-            await asyncio.sleep(min(wait, 10))
+                break # Timeout reached, proceed to disconnect
+            await asyncio.sleep(min(wait, 60)) # Check more frequently but don't spin
     except asyncio.CancelledError:
+        log.debug("Idle disconnect task cancelled for guild %s", guild_id)
         return
+    
     guild = bot.get_guild(guild_id)
     if not guild:
         return
-    vc = guild.voice_client
-    if vc and vc.is_connected() and not vc.is_playing():
-        try:
-            await vc.disconnect(force=False)
-            log.info("Idle timeout: disconnected from guild %s", guild_id)
-        except Exception as e:
-            log.warning("Idle disconnect failed: %s", e)
+    vc_client = guild.voice_client
+    if vc_client and vc_client.is_connected() and not vc_client.is_playing():
+        # Final check - only disconnect if no non-bot users present
+        if isinstance(vc_client.channel, discord.VoiceChannel):
+            non_bot_members = [m for m in vc_client.channel.members if not m.bot]
+            if len(non_bot_members) == 0:
+                try:
+                    await vc_client.disconnect(force=False)
+                    log.info("Idle timeout: disconnected from guild %s (no non-bot users present)", guild_id)
+                except Exception as e:
+                    log.warning("Idle disconnect failed for guild %s: %s", guild_id, e)
+            else:
+                log.info("Idle timeout prevented: %d non-bot users still in VC for guild %s", len(non_bot_members), guild_id)
 
 async def _disconnect_after_play(guild_id: int):
     await asyncio.sleep(DISCONNECT_AFTER_PLAY_SECS)
     guild = bot.get_guild(guild_id)
     if not guild:
         return
-    vc = guild.voice_client
-    if vc and vc.is_connected() and not vc.is_playing():
-        try:
-            await vc.disconnect(force=False)
-            log.info("Post-play disconnect after %ss in guild %s", DISCONNECT_AFTER_PLAY_SECS, guild_id)
-        except Exception as e:
-            log.warning("Post-play disconnect failed: %s", e)
+    vc_client = guild.voice_client
+    if vc_client and vc_client.is_connected() and not vc_client.is_playing():
+        # Only disconnect if no non-bot users are in the VC
+        if isinstance(vc_client.channel, discord.VoiceChannel):
+            non_bot_members = [m for m in vc_client.channel.members if not m.bot]
+            if len(non_bot_members) == 0:
+                try:
+                    await vc_client.disconnect(force=False)
+                    log.info("Post-play disconnect after %ss in guild %s (no non-bot users present)", DISCONNECT_AFTER_PLAY_SECS, guild_id)
+                except Exception as e:
+                    log.warning("Post-play disconnect failed for guild %s: %s", guild_id, e)
+            else:
+                log.info("Skipping post-play disconnect: %d non-bot users still in VC for guild %s", len(non_bot_members), guild_id)
 
 async def _on_playback_finished(guild_id: int):
     _touch_activity(guild_id)
@@ -717,6 +756,10 @@ async def delete_rally_for_vc(guild: discord.Guild, vc: discord.VoiceChannel, re
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Call the activity checker when voice state changes
+    if member.guild:
+        _touch_activity(member.guild.id) # Reset idle timer on any voice state update
+
     for ch in (before.channel, after.channel):
         if not isinstance(ch, discord.VoiceChannel):
             continue
@@ -743,7 +786,58 @@ async def vc_hold(interaction: discord.Interaction, seconds: int = 60):
     finally:
         pass
 
+@tree.command(name="stay", description="Keep the bot in voice chat until manually disconnected")
+async def stay_command(interaction: discord.Interaction):
+    member: discord.Member = interaction.user  # type: ignore
+    await interaction.response.defer(ephemeral=True)
+
+    if not member.voice or not isinstance(member.voice.channel, discord.VoiceChannel):
+        return await interaction.followup.send("You must be in a voice channel first.", ephemeral=True)
+    
+    voice, err = await _ensure_voice_ready(member)
+    if not voice:
+        return await interaction.followup.send(f"Failed to connect: {err}", ephemeral=True)
+    
+    # Keep updating activity to prevent auto-disconnect
+    _touch_activity(member.guild.id)
+    await interaction.followup.send("I'll stay in your voice channel. Use `/leave` to disconnect me.", ephemeral=True)
+
+@tree.command(name="leave", description="Disconnect the bot from voice chat")
+async def leave_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.guild and interaction.guild.voice_client and interaction.guild.voice_client.is_connected():
+        guild_id = interaction.guild.id
+        try:
+            if guild_id in VOICE_STATE:
+                if VOICE_STATE[guild_id].idle_task and not VOICE_STATE[guild_id].idle_task.done():
+                    VOICE_STATE[guild_id].idle_task.cancel()
+                if VOICE_STATE[guild_id].post_play_task and not VOICE_STATE[guild_id].post_play_task.done():
+                    VOICE_STATE[guild_id].post_play_task.cancel()
+            await interaction.guild.voice_client.disconnect()
+            log.info("Bot manually disconnected from guild %s.", guild_id)
+            await interaction.followup.send("Disconnected from voice chat.", ephemeral=True)
+        except Exception as e:
+            log.error("Error during manual disconnect for guild %s: %s", guild_id, e)
+            await interaction.followup.send(f"Failed to disconnect: {e}", ephemeral=True)
+    else:
+        await interaction.followup.send("I'm not connected to voice chat.", ephemeral=True)
+
 # ============================== LIFECYCLE ==============================
+async def _periodic_activity_check():
+    """Periodically check for user activity in connected voice channels to keep the bot alive."""
+    await bot.wait_until_ready()
+    log.info("Starting periodic voice activity check.")
+    while not bot.is_closed():
+        try:
+            # Iterate over a copy of keys to allow modification during iteration if a guild disconnects
+            for guild_id in list(VOICE_STATE.keys()):
+                if bot.get_guild(guild_id) and bot.get_guild(guild_id).voice_client:
+                    await _check_user_activity(guild_id)
+            await asyncio.sleep(60)  # Check every minute
+        except Exception as e:
+            log.warning("Error in periodic activity check: %s", e)
+            await asyncio.sleep(60) # Wait before retrying to prevent busy-looping
+
 @bot.event
 async def on_ready():
     try:
@@ -763,6 +857,9 @@ async def on_ready():
         bot.user, bot.user.id, ENABLE_VOICE, DISCONNECT_AFTER_PLAY_SECS, VOICE_IDLE_TIMEOUT_SECS,
         RTC_REGION_FOR_TEMP_VC or "auto", FORCE_RTC_REGION or "off"
     )
+    # Start the periodic activity checker
+    bot.loop.create_task(_periodic_activity_check())
+
 
 # ============================== ENTRYPOINT ==============================
 if __name__ == "__main__":
